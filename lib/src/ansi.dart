@@ -1,0 +1,30 @@
+import 'dart:io';
+
+/// ANSI styling for the harness's live output.
+///
+/// Pure string helpers so the rendering logic stays unit-testable: construct
+/// `Ansi(enabled: false)` in tests to get plain strings, or `Ansi.forStdout()`
+/// in production. Color is suppressed when stdout is not a terminal or when
+/// `NO_COLOR` is set (https://no-color.org/).
+class Ansi {
+  const Ansi({required this.enabled});
+
+  factory Ansi.forStdout() => Ansi(
+    enabled:
+        stdout.hasTerminal && !Platform.environment.containsKey('NO_COLOR'),
+  );
+
+  final bool enabled;
+
+  String _wrap(String code, String text) =>
+      enabled ? '\x1B[${code}m$text\x1B[0m' : text;
+
+  String red(String t) => _wrap('31', t);
+  String green(String t) => _wrap('32', t);
+  String yellow(String t) => _wrap('33', t);
+  String blue(String t) => _wrap('34', t);
+  String magenta(String t) => _wrap('35', t);
+  String cyan(String t) => _wrap('36', t);
+  String dim(String t) => _wrap('2', t);
+  String bold(String t) => _wrap('1', t);
+}
