@@ -58,14 +58,22 @@ class HarnessLoop {
       }
 
       var processed = 0;
+      var capHit = false;
       while (true) {
         final activeParent = await _selectActivePrd();
-        if (activeParent == null) {
-          print('No processable ready-for-agent issues remain. Done.');
+        if (activeParent == null) break;
+        processed += await _drainPrd(activeParent, processed);
+        if (config.iterations != null && processed >= config.iterations!) {
+          capHit = true;
           break;
         }
-        processed += await _drainPrd(activeParent, processed);
-        if (config.iterations != null && processed >= config.iterations!) break;
+      }
+      if (!capHit) {
+        // Queue is drained. A PRD whose last failed sub was resolved (closed in
+        // a later run or by a human) never re-enters selection, so its branch
+        // would otherwise sit un-PR'd forever. Sweep for those and ship them.
+        await _shipStrandedPrds();
+        print('No processable ready-for-agent issues remain. Done.');
       }
       return 0;
     } on ClaudeAbort catch (e) {
@@ -84,6 +92,7 @@ class HarnessLoop {
       print('No ready-for-agent issues found.');
       return 0;
     }
+    final umbrellas = umbrellaNumbers(ready);
     int? activeParent;
     final processable = <Issue>[];
     final blocked = <Issue>[];
@@ -103,9 +112,15 @@ class HarnessLoop {
     print('Active PRD #$activeParent: $title');
     print('Branch:     $activeParent-${slugify(title)}');
     print('');
+    if (umbrellas.contains(activeParent)) {
+      print('Umbrella PRD #$activeParent — not implemented; closed by its PR.');
+      print('');
+    }
     print('Would process (in order):');
     for (final issue in processable.where(
-      (i) => parentOf(i.body, i.number) == activeParent,
+      (i) =>
+          parentOf(i.body, i.number) == activeParent &&
+          !umbrellas.contains(i.number),
     )) {
       print(
         '  #${issue.number} [p${priorityScore(issue.labels)}] '
@@ -207,18 +222,27 @@ class HarnessLoop {
     if (!await _checkoutPrdBranch(activeParent)) return 0;
 
     _prdCostUsd = 0;
-    var prdFailed = false;
     var count = 0;
     while (true) {
+      final ready = await gh.readyIssues(config.state);
+      final umbrellas = umbrellaNumbers(ready);
       Issue? sub;
-      for (final issue in await gh.readyIssues(config.state)) {
+      for (final issue in ready) {
         if (parentOf(issue.body, issue.number) != activeParent) continue;
+        if (umbrellas.contains(issue.number)) {
+          await gh.dropAgentLabel(issue.number);
+          print(
+            '  ${ansi.dim('#${issue.number} is an umbrella PRD (has sub-issues) '
+            '→ dropped from agent queue; closed by its PR.')}',
+          );
+          continue;
+        }
         if (!await gh.allBlockersClosed(issue.body)) continue;
         sub = issue;
         break;
       }
       if (sub == null) break;
-      if (!await _processSub(sub)) prdFailed = true;
+      await _processSub(sub);
       count++;
       final total = alreadyProcessed + count;
       if (config.iterations != null && total >= config.iterations!) {
@@ -226,8 +250,70 @@ class HarnessLoop {
       }
     }
 
-    await _openPrIfClean(activeParent, prdFailed);
+    await _maybeOpenPr(activeParent);
     return count;
+  }
+
+  /// Ships any PRD branch whose work is done but never got a PR — typically a
+  /// PRD that had a failed sub which was later resolved (closed in a subsequent
+  /// run or by a human) without re-entering the `ready-for-agent` queue, so
+  /// [_drainPrd] never ran again to PR it. Idempotent: branches that already
+  /// have an open PR, still have open subs, or whose parent is closed are
+  /// skipped, so re-running the harness on a loop never re-opens or spams.
+  Future<void> _shipStrandedPrds() async {
+    for (final entry in await _strandedPrds()) {
+      final parent = entry.key;
+      final branch = entry.value;
+      final parked = await git.parkDrift();
+      if (parked != null) print('  Parked uncommitted drift in stash: $parked');
+      if (!await git.checkout(branch)) {
+        print('  cannot checkout $branch; skipping stranded PRD #$parent');
+        continue;
+      }
+      _prdCostUsd = 0;
+      print('');
+      print(
+        '  ${ansi.cyan('Shipping stranded PRD #$parent')} '
+        '(all sub-issues resolved, branch $branch)',
+      );
+      await _maybeOpenPr(parent);
+    }
+  }
+
+  /// Local PRD branches (`<parent#>-<slug>`) that are ready to PR but have not
+  /// been: parent still OPEN, no open managed subs, and no existing open PR.
+  Future<List<MapEntry<int, String>>> _strandedPrds() async {
+    final branchByParent = <int, String>{};
+    for (final branch in await git.localBranches()) {
+      final match = RegExp(r'^(\d+)-').firstMatch(branch);
+      if (match == null) continue;
+      branchByParent.putIfAbsent(int.parse(match.group(1)!), () => branch);
+    }
+    final stranded = <MapEntry<int, String>>[];
+    for (final entry in branchByParent.entries) {
+      if (await gh.issueState(entry.key) != 'OPEN') continue;
+      if (await gh.openPrForBranch(entry.value) != null) continue;
+      if ((await _openSubsOf(entry.key)).isNotEmpty) continue;
+      stranded.add(entry);
+    }
+    return stranded;
+  }
+
+  /// The PRD's sub-issues still in flight: open issues parented to
+  /// [activeParent] that the harness manages (`ready-for-agent` or
+  /// `ready-for-human`). A previously-failed sub that has since been closed is
+  /// no longer here, so it stops blocking the PR — this is the live-state
+  /// replacement for the old sticky in-run `prdFailed` flag.
+  Future<List<Issue>> _openSubsOf(int activeParent) async {
+    final byNumber = <int, Issue>{};
+    for (final label in const ['ready-for-agent', 'ready-for-human']) {
+      for (final issue in await gh.issuesWithLabel(label, 'open')) {
+        if (parentOf(issue.body, issue.number) == activeParent) {
+          byNumber[issue.number] = issue;
+        }
+      }
+    }
+    return byNumber.values.toList();
   }
 
   Future<bool> _processSub(Issue issue) async {
@@ -350,12 +436,15 @@ class HarnessLoop {
     return result.ok;
   }
 
-  Future<void> _openPrIfClean(int activeParent, bool prdFailed) async {
+  Future<void> _maybeOpenPr(int activeParent) async {
     await git.fetch(config.base);
     final ahead = await git.aheadOf(config.base);
-    if (prdFailed || ahead == 0) {
+    final openSubs = await _openSubsOf(activeParent);
+    if (openSubs.isNotEmpty || ahead == 0) {
+      final refs = openSubs.map((i) => '#${i.number}').join(', ');
       print(
-        '  PRD #$activeParent not PR\'d (failed_subs=${prdFailed ? 1 : 0}, '
+        '  PRD #$activeParent not PR\'d '
+        '(open_subs=${openSubs.length}${refs.isEmpty ? '' : ' [$refs]'}, '
         'commits_ahead=$ahead). Branch left for human.',
       );
       return;

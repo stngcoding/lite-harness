@@ -66,7 +66,8 @@ Pure, dependency-free logic is isolated into the modules that carry the unit
 tests — this is the code to touch carefully:
 
 - `issue.dart` — `Issue` model + parsing of `## Parent` / `## Blocked by`
-  sections, `priorityScore` (label → rank), `sortReady`, `slugify`.
+  sections, `priorityScore` (label → rank), `sortReady`, `slugify`,
+  `umbrellaNumbers` (which ready issues are the *parent* of another).
 - `claude_stream.dart` — parses `stream-json` lines into `StreamEvent`s and
   renders a live transcript; `StreamRenderer.transcript` is the string the
   verdict is read from.
@@ -78,8 +79,14 @@ tests — this is the code to touch carefully:
 ### The per-PRD flow (loop.dart)
 
 1. Select the active PRD from the highest-priority *processable* ready issue
-   (processable = every `## Blocked by` issue is CLOSED). A parent-less issue is
-   its own PRD-of-one.
+   (processable = every `## Blocked by` issue is CLOSED). A parent-less issue
+   with no children is its own PRD-of-one. A parent-less issue that *other*
+   ready issues declare as `## Parent` is an **umbrella**: it only groups its
+   slices and is closed by the PR's `Closes #parent`. `_drainPrd` detects
+   umbrellas via `umbrellaNumbers`, never implements them, and drops their
+   `ready-for-agent` label (`GhCli.dropAgentLabel`) so they cannot re-enter
+   selection. Implementing an umbrella would redo the whole PRD scope once on
+   top of every slice.
 2. Check out `<parent#>-<slug>` off `origin/<base>` (resume if it exists; park
    uncommitted drift in a stash first).
 3. For each processable sub-issue: **Implement** (`claude -p`) → **commit**
@@ -87,14 +94,23 @@ tests — this is the code to touch carefully:
    independent `diff-verifier` over `baseline..HEAD`). PASS → close the issue;
    FAIL → tag `ralph-fail/<n>`, `reset --hard` to baseline, relabel
    `ready-for-human`, comment with reviewer output + log tails.
-4. On a clean sweep with real commits ahead of base: push, open one draft PR,
+4. When commits are ahead of base and the PRD has **no open managed subs left**
+   (`_maybeOpenPr` re-checks GitHub live — no open issue parented to the PRD is
+   still labeled `ready-for-agent`/`ready-for-human`), push, open one draft PR,
    run the PR-level `diff-verifier` over the whole diff, mark ready only if it
-   passes. In PR mode (`pr-verifier.md`) the orchestrator runs the reverse-
-   engineered Anthropic `/code-review` pipeline — triage → five independent
-   review lenses (CLAUDE.md, bug scan, git history, prior PRs, in-code comments)
-   fanned out via `Task` → per-issue 0–100 confidence scoring → drop everything
-   below 80 → a cited PASS/FAIL. It still ends in the single bare `VERDICT:` line
-   the harness reads.
+   passes. The gate is live state, not an in-run flag: a sub that failed earlier
+   but was since closed no longer blocks the PR. In PR mode (`pr-verifier.md`)
+   the orchestrator runs the reverse-engineered Anthropic `/code-review`
+   pipeline — triage → five independent review lenses (CLAUDE.md, bug scan, git
+   history, prior PRs, in-code comments) fanned out via `Task` → per-issue 0–100
+   confidence scoring → drop everything below 80 → a cited PASS/FAIL. It still
+   ends in the single bare `VERDICT:` line the harness reads.
+5. **Stranded-PRD sweep.** After the ready queue empties, `_shipStrandedPrds`
+   walks local `<parent#>-<slug>` branches and PRs any whose parent is still
+   OPEN, has no open managed subs, commits ahead, and no existing open PR. This
+   catches PRDs whose last failed sub was resolved (re-run or human close) after
+   the PRD had already fallen out of selection — without it, that branch never
+   gets a PR. Idempotent, so a looping harness never re-opens or spams.
 
 ### Conventions that matter
 

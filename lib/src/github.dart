@@ -22,7 +22,10 @@ class GhCli {
     return result.ok && name.isNotEmpty ? name : null;
   }
 
-  Future<List<Issue>> readyIssues(String state) async {
+  Future<List<Issue>> readyIssues(String state) async =>
+      sortReady(await issuesWithLabel('ready-for-agent', state));
+
+  Future<List<Issue>> issuesWithLabel(String label, String state) async {
     final result = await _proc.run('gh', [
       'issue',
       'list',
@@ -31,7 +34,7 @@ class GhCli {
       '--state',
       state,
       '--label',
-      'ready-for-agent',
+      label,
       '--limit',
       '100',
       '--json',
@@ -40,12 +43,32 @@ class GhCli {
     if (!result.ok) return const [];
     try {
       final list = jsonDecode(result.stdout) as List;
-      return sortReady([
+      return [
         for (final json in list) Issue.fromJson(json as Map<String, dynamic>),
-      ]);
+      ];
     } on FormatException {
       return const [];
     }
+  }
+
+  /// URL of the open PR whose head is [branch], or null when none exists.
+  Future<String?> openPrForBranch(String branch) async {
+    final result = await _proc.run('gh', [
+      'pr',
+      'list',
+      '--repo',
+      repo,
+      '--head',
+      branch,
+      '--state',
+      'open',
+      '--json',
+      'url',
+      '-q',
+      '.[0].url',
+    ]);
+    final url = result.stdout.trim();
+    return result.ok && url.isNotEmpty ? url : null;
   }
 
   Future<String> issueState(int number) async {
@@ -111,15 +134,26 @@ class GhCli {
     return result.ok && title.isNotEmpty ? title : 'prd-$number';
   }
 
-  Future<void> closeIssue(int number, String comment) => _quiet([
-    'issue',
-    'close',
-    '$number',
-    '--repo',
-    repo,
-    '--comment',
-    comment,
-  ]);
+  Future<void> closeIssue(int number, String comment) async {
+    await _quiet([
+      'issue',
+      'edit',
+      '$number',
+      '--repo',
+      repo,
+      '--remove-label',
+      'ready-for-agent',
+    ]);
+    await _quiet([
+      'issue',
+      'close',
+      '$number',
+      '--repo',
+      repo,
+      '--comment',
+      comment,
+    ]);
+  }
 
   Future<void> relabelForHuman(int number) => _quiet([
     'issue',
@@ -135,6 +169,19 @@ class GhCli {
 
   Future<void> commentOnIssue(int number, String body) =>
       _quiet(['issue', 'comment', '$number', '--repo', repo, '--body', body]);
+
+  /// Removes `ready-for-agent` without closing or relabeling. Used to take an
+  /// umbrella PRD out of the agent queue: it is not a work item and is closed
+  /// by its PR's `Closes #parent`, so it should never re-enter selection.
+  Future<void> dropAgentLabel(int number) => _quiet([
+    'issue',
+    'edit',
+    '$number',
+    '--repo',
+    repo,
+    '--remove-label',
+    'ready-for-agent',
+  ]);
 
   Future<String?> createDraftPr({
     required String base,

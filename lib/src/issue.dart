@@ -63,6 +63,19 @@ List<int> blockersOf(String body) => RegExp(r'#(\d+)')
     .map((m) => int.parse(m.group(1)!))
     .toList();
 
+/// Numbers of issues in [issues] that are the `## Parent` of at least one
+/// other issue — the umbrella PRDs. An umbrella only groups its slices and is
+/// closed by the PR (`Closes #parent`); implementing it as a work item redoes
+/// the whole PRD scope once more on top of every slice.
+Set<int> umbrellaNumbers(Iterable<Issue> issues) {
+  final umbrellas = <int>{};
+  for (final issue in issues) {
+    final parent = parentOf(issue.body, issue.number);
+    if (parent != issue.number) umbrellas.add(parent);
+  }
+  return umbrellas;
+}
+
 String _section(String body, String heading) {
   final lines = body.split('\n');
   final buffer = StringBuffer();

@@ -83,6 +83,37 @@ void main() {
     });
   });
 
+  group('umbrellaNumbers', () {
+    Issue issue(int number, String body) =>
+        Issue(number: number, title: 't', body: body, labels: [], url: 'u');
+
+    test('flags a parent-less issue that other issues declare as parent', () {
+      final umbrellas = umbrellaNumbers([
+        issue(263, 'PRD spec, no Parent section'),
+        issue(264, '## Parent\n#263\n'),
+        issue(265, '## Parent\n#263\n'),
+      ]);
+      expect(umbrellas, {263});
+    });
+
+    test('a parent-less issue with no children is not an umbrella', () {
+      expect(umbrellaNumbers([issue(10, 'standalone, no Parent')]), isEmpty);
+    });
+
+    test('does not flag an issue solely from its own self-parent', () {
+      expect(umbrellaNumbers([issue(10, 'no Parent section')]), isEmpty);
+    });
+
+    test('collects multiple distinct umbrellas', () {
+      final umbrellas = umbrellaNumbers([
+        issue(1, '## Parent\n#100\n'),
+        issue(2, '## Parent\n#200\n'),
+        issue(3, '## Parent\n#100\n'),
+      ]);
+      expect(umbrellas, {100, 200});
+    });
+  });
+
   group('slugify', () {
     test('lowercases and replaces runs of non-alphanumerics with one dash', () {
       expect(slugify('Fix: WebSocket reconnect!!'), 'fix-websocket-reconnect');

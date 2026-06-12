@@ -50,6 +50,16 @@ class GitOps {
   Future<bool> branchExists(String branch) =>
       _succeeds(['show-ref', '--verify', '--quiet', 'refs/heads/$branch']);
 
+  Future<List<String>> localBranches() async {
+    final out = await _out(['branch', '--format=%(refname:short)']);
+    if (out.isEmpty) return const [];
+    return out
+        .split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+  }
+
   Future<bool> checkout(String branch) => _succeeds(['checkout', branch]);
 
   Future<bool> checkoutNew(String branch, String from) async {
