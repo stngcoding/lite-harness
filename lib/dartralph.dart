@@ -10,4 +10,5 @@ export 'src/loop.dart';
 export 'src/phase.dart';
 export 'src/proc.dart';
 export 'src/prompts.dart';
+export 'src/test_scope.dart';
 export 'src/verdict.dart';

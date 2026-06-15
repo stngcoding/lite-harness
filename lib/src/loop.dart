@@ -9,6 +9,7 @@ import 'issue.dart';
 import 'phase.dart';
 import 'proc.dart';
 import 'prompts.dart';
+import 'test_scope.dart';
 import 'verdict.dart';
 
 const _analyzeLog = '/tmp/ralph-analyze.log';
@@ -349,15 +350,12 @@ class HarnessLoop {
         'flutter',
         'analyze',
       ], _analyzeLog);
-      final testOk = await _gate(HarnessPhase.test, [
-        'flutter',
-        'test',
-      ], _testLog);
+      final testOk = await _scopedTestGate(baseline, issue.number);
       if (analyzeOk && testOk) {
         await gh.closeIssue(
           issue.number,
           'No new changes needed — current state passes all gates '
-          '(analyze + tests).$implementSummary',
+          '(analyze + scoped tests).$implementSummary',
         );
         print('  ${ansi.green('✓')} #${issue.number} already done → closed.');
         return true;
@@ -387,16 +385,13 @@ class HarnessLoop {
       'flutter',
       'analyze',
     ], _analyzeLog);
-    final testOk = await _gate(HarnessPhase.test, [
-      'flutter',
-      'test',
-    ], _testLog);
+    final testOk = await _scopedTestGate(baseline, issue.number);
 
     if (analyzeOk && testOk) {
       await gh.closeIssue(
         issue.number,
         'Verified by AFK loop on branch `${await git.currentBranch()}`: '
-        'analyze + tests green.$implementSummary',
+        'analyze + scoped tests green.$implementSummary',
       );
       print('  ${ansi.green('✓ #${issue.number} PASS → closed.')}');
       return true;
@@ -421,6 +416,28 @@ class HarnessLoop {
       ),
     );
     return false;
+  }
+
+  /// The per-issue test gate: runs only the tests the slice's diff scopes to
+  /// (changed `*_test.dart` plus the mirror test of each changed `lib/` file),
+  /// so a slice is never failed for a pre-existing red test it did not touch.
+  /// The whole suite runs once at the PR gate. An empty scope passes — there is
+  /// nothing the slice changed to test here; the PR gate is the backstop.
+  Future<bool> _scopedTestGate(String baseline, int number) async {
+    final scoped = scopedTestFiles(
+      await git.changedFiles(baseline),
+    ).where((path) => File(path).existsSync()).toList()..sort();
+    if (scoped.isEmpty) {
+      print(
+        '  ${ansi.dim('No scoped tests for #$number '
+        '→ test gate skipped (full suite runs at PR).')}',
+      );
+      return true;
+    }
+    print(
+      '  ${ansi.dim('Scoped tests (${scoped.length}): ${scoped.join(', ')}')}',
+    );
+    return _gate(HarnessPhase.test, ['flutter', 'test', ...scoped], _testLog);
   }
 
   Future<bool> _gate(
@@ -472,6 +489,18 @@ class HarnessLoop {
     print('  PR: ${ansi.cyan(prUrl ?? '<none>')}');
     if (prUrl == null) return;
 
+    // PR gate: the whole suite, not the per-issue scoped subset. A red base
+    // (pre-existing failures) keeps the PR a draft for a human — work is never
+    // discarded here, only the auto-ready signal is withheld.
+    final analyzeOk = await _gate(HarnessPhase.analyze, [
+      'flutter',
+      'analyze',
+    ], _analyzeLog);
+    final testOk = await _gate(HarnessPhase.test, [
+      'flutter',
+      'test',
+    ], _testLog);
+
     _phase(HarnessPhase.review, 'PR #$activeParent');
     final review = await claude.verify(
       prompts.prVerifier(
@@ -488,17 +517,26 @@ class HarnessLoop {
     final reviewSummary = review.result == null
         ? ''
         : '\n\n_Review: ${review.result!.summary}._';
+    final suiteLine =
+        'Full suite: analyze=${analyzeOk ? 'pass' : 'fail'} '
+        'test=${testOk ? 'pass' : 'fail'}.';
     await gh.commentOnPr(
       prUrl,
-      '**AFK PR review (diff-verifier)**\n\n$verdict$reviewSummary\n\n'
-      '_Total AFK spend for PRD #$activeParent: '
+      '**AFK PR review (diff-verifier)**\n\n$suiteLine\n\n$verdict$reviewSummary'
+      '\n\n_Total AFK spend for PRD #$activeParent: '
       '\$${_prdCostUsd.toStringAsFixed(4)}._',
     );
-    if (hasPassVerdict(verdict)) {
+    if (analyzeOk && testOk && hasPassVerdict(verdict)) {
       await gh.markPrReady(prUrl);
-      print('  ${ansi.green('✓ PR review PASS → marked ready.')}');
+      print('  ${ansi.green('✓ Full suite + PR review PASS → marked ready.')}');
     } else {
-      print('  ${ansi.red('✗ PR review FAIL → left as draft for human.')}');
+      print(
+        ansi.red(
+          '  ✗ PR left as draft for human '
+          '(analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0} '
+          'review=${hasPassVerdict(verdict) ? 1 : 0}).',
+        ),
+      );
     }
   }
 

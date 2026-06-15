@@ -69,6 +69,18 @@ class GitOps {
 
   Future<String> head() => _out(['rev-parse', 'HEAD']);
 
+  /// Repo-relative paths that changed between [baseline] and `HEAD` — the files
+  /// a slice's commit touched, used to scope its test gate.
+  Future<List<String>> changedFiles(String baseline) async {
+    final out = await _out(['diff', '--name-only', baseline, 'HEAD']);
+    if (out.isEmpty) return const [];
+    return out
+        .split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+  }
+
   Future<String> currentBranch() => _out(['rev-parse', '--abbrev-ref', 'HEAD']);
 
   Future<bool> commitAll(String message) async {

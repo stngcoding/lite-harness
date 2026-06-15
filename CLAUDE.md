@@ -90,16 +90,24 @@ tests — this is the code to touch carefully:
 2. Check out `<parent#>-<slug>` off `origin/<base>` (resume if it exists; park
    uncommitted drift in a stash first).
 3. For each processable sub-issue: **Implement** (`claude -p`) → **commit**
-   immediately → **gate** (`fvm flutter analyze` + `fvm flutter test` + an
-   independent `diff-verifier` over `baseline..HEAD`). PASS → close the issue;
-   FAIL → tag `ralph-fail/<n>`, `reset --hard` to baseline, relabel
-   `ready-for-human`, comment with reviewer output + log tails.
+   immediately → **gate** (`fvm flutter analyze` + a *scoped* `fvm flutter
+   test`). The test gate runs only the tests the slice's diff touches —
+   `scopedTestFiles` (`test_scope.dart`) maps the changed paths to each changed
+   `test/…_test.dart` plus the mirror `_test.dart` of every changed `lib/…dart`
+   (`_scopedTestGate` filters those to the ones that exist). So a pre-existing
+   red test on base never fails a slice; an empty scope passes (the PR gate is
+   the backstop). PASS → close the issue; FAIL → tag `ralph-fail/<n>`, `reset
+   --hard` to baseline, relabel `ready-for-human`, comment with log tails.
 4. When commits are ahead of base and the PRD has **no open managed subs left**
    (`_maybeOpenPr` re-checks GitHub live — no open issue parented to the PRD is
    still labeled `ready-for-agent`/`ready-for-human`), push, open one draft PR,
-   run the PR-level `diff-verifier` over the whole diff, mark ready only if it
-   passes. The gate is live state, not an in-run flag: a sub that failed earlier
-   but was since closed no longer blocks the PR. In PR mode (`pr-verifier.md`)
+   run the **whole suite** here (`fvm flutter analyze` + full `fvm flutter
+   test` — the per-issue gates were scoped) plus the PR-level `diff-verifier`
+   over the whole diff, mark ready only if the full suite is green **and** the
+   review passes. A red base keeps the PR a draft for a human — non-destructive,
+   nothing is rolled back here. The gate is live state, not an in-run flag: a
+   sub that failed earlier but was since closed no longer blocks the PR. In PR
+   mode (`pr-verifier.md`)
    the orchestrator runs the reverse-engineered Anthropic `/code-review`
    pipeline — triage → five independent review lenses (CLAUDE.md, bug scan, git
    history, prior PRs, in-code comments) fanned out via `Task` → per-issue 0–100
@@ -122,7 +130,8 @@ tests — this is the code to touch carefully:
   `AgentInstaller.bundledAgents`) is excluded from drift detection and commits so
   tooling churn — and the agents the harness drops in — never ride along.
 - **Gates shell out to `fvm flutter`** in the *target* repo, writing logs to
-  `/tmp/ralph-analyze.log` and `/tmp/ralph-test.log`.
+  `/tmp/ralph-analyze.log` and `/tmp/ralph-test.log`. Per-issue the test gate is
+  **scoped** to the slice's diff; the **full** suite runs once at the PR gate.
 - **Testing split:** pure logic (issue/stream/verdict parsing) is unit-tested;
   the `gh`/`git`/`claude` wrappers are intentionally untested. Keep new pure
   logic in those modules and cover it; keep the wrappers thin.
