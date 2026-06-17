@@ -25,7 +25,7 @@ ArgParser _buildParser() => ArgParser()
     help: 'Issue state filter (default: open, env STATE).',
   )
   ..addOption('base', help: 'PR base branch (default: dev, env BASE).')
-  ..addOption('model', help: 'Implementer model (default: sonnet, env MODEL).')
+  ..addOption('model', help: 'Implementer model (default: opus, env MODEL).')
   ..addOption(
     'issue',
     abbr: 'n',
@@ -170,7 +170,7 @@ Future<void> _run(List<String> arguments, String debugLogPath) async {
     repo: repo,
     state: options['state'] as String? ?? env['STATE'] ?? 'open',
     base: options['base'] as String? ?? env['BASE'] ?? 'dev',
-    model: options['model'] as String? ?? env['MODEL'] ?? 'sonnet',
+    model: options['model'] as String? ?? env['MODEL'] ?? 'opus',
     dryRun: options['dry-run'] as bool,
     iterations: iterations,
     issueNumber: issueNumber,

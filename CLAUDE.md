@@ -30,7 +30,7 @@ dart compile exe bin/dartralph.dart -o build/dartralph   # standalone binary
 
 Key flags (all also read env vars): `--repo owner/name` (REPO),
 `--state open|closed|all` (STATE), `--base <branch>` (BASE, default `dev`),
-`--model <model>` (MODEL, default `sonnet`), `--issue N`, `--once`, `--dry-run`.
+`--model <model>` (MODEL, default `opus`), `--issue N`, `--once`, `--dry-run`.
 
 ## Architecture
 

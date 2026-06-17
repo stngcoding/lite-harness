@@ -43,7 +43,7 @@ dart run ~/lite-harness/bin/dartralph.dart [options]
 | `--repo owner/name` | auto-detect (env `REPO`) | Target GitHub repo |
 | `--state open\|closed\|all` | `open` (env `STATE`) | Issue state filter |
 | `--base <branch>` | `dev` (env `BASE`) | PR base branch |
-| `--model <model>` | `sonnet` (env `MODEL`) | Implementer model |
+| `--model <model>` | `opus` (env `MODEL`) | Implementer model |
 | `--issue N` | — | Process only issue N, then exit |
 | `--once` | off | Process exactly one sub-issue, then exit |
 | `--dry-run` | off | Print the PRD and sub-issue order; change nothing |
