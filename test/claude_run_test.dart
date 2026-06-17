@@ -30,12 +30,13 @@ void main() {
       expect(run.fatalError, contains('rate limited'));
     });
 
-    test('reports a missing result event as a streaming failure', () {
+    test('a missing result event is transient, not a hard abort', () {
       const run = ClaudeRun(transcript: '');
-      expect(run.fatalError, contains('without a result'));
+      expect(run.fatalError, isNull);
+      expect(run.transientApiError, contains('without a result'));
     });
 
-    test('reports an execution error with its message', () {
+    test('an auth-status execution error is hard fatal, not transient', () {
       final run = ClaudeRun(
         transcript: '',
         result: _result(
@@ -44,6 +45,7 @@ void main() {
         ),
       );
       expect(run.fatalError, contains('Unauthorized'));
+      expect(run.transientApiError, isNull);
     });
 
     test('max-turns is recoverable per-task, not a loop abort', () {
@@ -54,6 +56,45 @@ void main() {
         ),
       );
       expect(run.fatalError, isNull);
+      expect(run.transientApiError, isNull);
+    });
+  });
+
+  group('ClaudeRun.transientApiError', () {
+    test('an overloaded execution error is transient', () {
+      final run = ClaudeRun(
+        transcript: '',
+        result: _result(
+          '{"type":"result","subtype":"error_during_execution",'
+          '"is_error":true,"api_error_status":529,"result":"Overloaded"}',
+        ),
+      );
+      expect(run.transientApiError, contains('Overloaded'));
+      expect(run.fatalError, isNull);
+    });
+
+    test('a 5xx surfaced via an errored success is transient', () {
+      final run = ClaudeRun(
+        transcript: '',
+        result: _result(
+          '{"type":"result","subtype":"success",'
+          '"is_error":true,"api_error_status":503}',
+        ),
+      );
+      expect(run.transientApiError, isNotNull);
+      expect(run.fatalError, isNull);
+    });
+
+    test('a rate limit is hard fatal, never transient', () {
+      final run = ClaudeRun(
+        transcript: '',
+        rateLimited: _rateLimit(
+          '{"type":"rate_limit_event","rate_limit_info":'
+          '{"status":"rate_limited"}}',
+        ),
+      );
+      expect(run.transientApiError, isNull);
+      expect(run.fatalError, contains('rate limited'));
     });
   });
 }

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'ansi.dart';
 import 'claude.dart';
 import 'config.dart';
+import 'event_log.dart';
 import 'git.dart';
 import 'github.dart';
 import 'issue.dart';
@@ -23,8 +24,15 @@ class HarnessLoop {
     required this.claude,
     required this.proc,
     required this.prompts,
+    EventLog? events,
     Ansi? ansi,
-  }) : ansi = ansi ?? Ansi.forStdout();
+    this.apiRetryBackoff = const [
+      Duration(seconds: 5),
+      Duration(seconds: 15),
+      Duration(seconds: 45),
+    ],
+  }) : events = events ?? EventLog(),
+       ansi = ansi ?? Ansi.forStdout();
 
   final Config config;
   final GhCli gh;
@@ -32,11 +40,26 @@ class HarnessLoop {
   final ClaudeRunner claude;
   final ProcessRunner proc;
   final PromptLibrary prompts;
+  final EventLog events;
   final Ansi ansi;
+
+  /// Backoff between retries of a `claude` run that hit a *transient* API
+  /// failure (overload/5xx, dropped stream, exhausted internal retry). One entry
+  /// per retry, so the length is the retry cap. A hard failure (rate limit,
+  /// auth, billing) is never retried. Injectable so tests don't actually sleep.
+  final List<Duration> apiRetryBackoff;
 
   /// Running `claude` API spend (USD) for the PRD currently being drained,
   /// summed from each slice's `result` event. Reset when a new PRD starts.
   double _prdCostUsd = 0;
+
+  /// Issue numbers already consumed in this run (processed as a sub, or dropped
+  /// as an umbrella). GitHub's issue list is eventually consistent: right after
+  /// `closeIssue`/`relabelForHuman`/`dropAgentLabel`, the next `gh issue list`
+  /// can still return the just-handled issue (a stale read), which would make
+  /// the loop implement it a second time. This in-memory guard makes selection
+  /// independent of that read-after-write lag.
+  final Set<int> _handled = {};
 
   /// Prints the active-stage marker, e.g. `▶ IMPLEMENT — #123 fix login`.
   void _phase(HarnessPhase phase, [String? detail]) =>
@@ -47,15 +70,56 @@ class HarnessLoop {
   /// fail the same way, so there is no point grinding through the queue. A
   /// per-task failure (max-turns, bad code) is not fatal and returns normally.
   void _abortIfFatal(ClaudeRun run, String context) {
-    final fatal = run.fatalError;
+    // A transient API failure that survived every retry is no longer
+    // recoverable, so it aborts here too — alongside the hard failures.
+    final fatal = run.fatalError ?? run.transientApiError;
     if (fatal != null) throw ClaudeAbort('$context — $fatal');
+  }
+
+  /// Runs a `claude` call, retrying on a *transient* API failure (overload/5xx,
+  /// dropped stream, exhausted internal retry) with [apiRetryBackoff]. Returns
+  /// as soon as a run is clean or hard-fatal; a transient run that survives the
+  /// last retry is returned for the caller's [_abortIfFatal] to abort on.
+  Future<ClaudeRun> _runWithApiRetry(
+    Future<ClaudeRun> Function() call,
+    String context,
+  ) async {
+    var run = await call();
+    for (var i = 0; i < apiRetryBackoff.length; i++) {
+      final transient = run.transientApiError;
+      if (transient == null) return run;
+      final wait = apiRetryBackoff[i];
+      events.event(
+        'API_RETRY',
+        detail:
+            '$context attempt=${i + 1}/${apiRetryBackoff.length} '
+            'wait=${wait.inSeconds}s — $transient',
+      );
+      print(
+        ansi.dim(
+          '  ⚠ API trouble ($transient) — retry ${i + 1}/'
+          '${apiRetryBackoff.length} in ${wait.inSeconds}s.',
+        ),
+      );
+      if (wait > Duration.zero) await Future<void>.delayed(wait);
+      run = await call();
+    }
+    return run;
   }
 
   Future<int> run() async {
     if (config.dryRun) return _dryRun();
+    events.event(
+      'START',
+      detail:
+          'repo=${config.repo} base=${config.base} state=${config.state}'
+          '${config.issueNumber != null ? ' issue=${config.issueNumber}' : ''}',
+    );
     try {
       if (config.issueNumber != null) {
-        return await _runSingle(config.issueNumber!);
+        final code = await _runSingle(config.issueNumber!);
+        events.event('DONE');
+        return code;
       }
 
       var processed = 0;
@@ -76,8 +140,10 @@ class HarnessLoop {
         await _shipStrandedPrds();
         print('No processable ready-for-agent issues remain. Done.');
       }
+      events.event('DONE');
       return 0;
     } on ClaudeAbort catch (e) {
+      events.event('ABORT', detail: e.message);
       stderr.writeln(ansi.red('✗ Fatal: ${e.message}'));
       stderr.writeln(
         'claude cannot continue — aborting the AFK loop. '
@@ -183,6 +249,7 @@ class HarnessLoop {
 
   Future<int?> _selectActivePrd() async {
     for (final issue in await gh.readyIssues(config.state)) {
+      if (_handled.contains(issue.number)) continue;
       if (await gh.allBlockersClosed(issue.body)) {
         return parentOf(issue.body, issue.number);
       }
@@ -208,13 +275,24 @@ class HarnessLoop {
 
     if (await git.branchExists(branch)) {
       if (!await git.checkout(branch)) {
+        events.event(
+          'CHECKOUT_FAIL',
+          prd: activeParent,
+          detail: 'branch=$branch',
+        );
         print('  cannot checkout $branch; skipping PRD');
         return false;
       }
     } else if (!await git.checkoutNew(branch, 'origin/${config.base}')) {
+      events.event(
+        'CHECKOUT_FAIL',
+        prd: activeParent,
+        detail: 'branch=$branch',
+      );
       print('  cannot create $branch; skipping PRD');
       return false;
     }
+    events.event('CHECKOUT', prd: activeParent, detail: 'branch=$branch');
     return true;
   }
 
@@ -230,8 +308,11 @@ class HarnessLoop {
       Issue? sub;
       for (final issue in ready) {
         if (parentOf(issue.body, issue.number) != activeParent) continue;
+        if (_handled.contains(issue.number)) continue;
         if (umbrellas.contains(issue.number)) {
           await gh.dropAgentLabel(issue.number);
+          _handled.add(issue.number);
+          events.event('UMBRELLA_DROP', prd: activeParent, issue: issue.number);
           print(
             '  ${ansi.dim('#${issue.number} is an umbrella PRD (has sub-issues) '
             '→ dropped from agent queue; closed by its PR.')}',
@@ -268,11 +349,17 @@ class HarnessLoop {
       final parked = await git.parkDrift();
       if (parked != null) print('  Parked uncommitted drift in stash: $parked');
       if (!await git.checkout(branch)) {
+        events.event(
+          'STRANDED_SKIP',
+          prd: parent,
+          detail: 'checkout-failed branch=$branch',
+        );
         print('  cannot checkout $branch; skipping stranded PRD #$parent');
         continue;
       }
       _prdCostUsd = 0;
       print('');
+      events.event('STRANDED_SHIP', prd: parent, detail: 'branch=$branch');
       print(
         '  ${ansi.cyan('Shipping stranded PRD #$parent')} '
         '(all sub-issues resolved, branch $branch)',
@@ -318,6 +405,10 @@ class HarnessLoop {
   }
 
   Future<bool> _processSub(Issue issue) async {
+    _handled.add(issue.number);
+    final parent = parentOf(issue.body, issue.number);
+    final prdRef = parent == issue.number ? null : parent;
+    events.event('ISSUE_START', prd: prdRef, issue: issue.number);
     final comments = await gh.issueComments(issue.number);
 
     final issuePhase = phaseOf(issue.body);
@@ -330,73 +421,153 @@ class HarnessLoop {
 
     final baseline = await git.head();
 
-    _phase(HarnessPhase.implement, '#${issue.number} ${issue.title}');
-    final run = await claude.implement(
-      model: config.model,
-      prompt: prompts.implementer(issue: issue, comments: comments),
-    );
-    _prdCostUsd += run.result?.costUsd ?? 0;
-    _abortIfFatal(run, 'Implement #${issue.number}');
-    final implementSummary = run.result == null
-        ? ''
-        : '\n\nImplement: ${run.result!.summary}.';
-    print('');
+    // One sub-issue gets up to `config.maxAttempts` shots: implement → commit
+    // → gate. A failing attempt is rolled back to [baseline] and the agent is
+    // re-run with the failing analyze/test logs fed back via `{{RETRY}}`, so it
+    // fixes forward instead of repeating the same mistake. Only after every
+    // attempt fails does the issue get tagged and handed to a human.
+    var analyzeOk = false;
+    var testOk = false;
+    var implementSummary = '';
+    var retry = '';
 
-    if (!await git.hasDrift()) {
-      // No uncommitted changes — check if current state already passes gates.
-      // This covers the case where a prior human commit resolved the issue and
-      // the agent correctly identifies no further work is needed.
-      final analyzeOk = await _gate(HarnessPhase.analyze, [
+    for (var attempt = 1; attempt <= config.maxAttempts; attempt++) {
+      if (attempt > 1) {
+        print(
+          '  ${ansi.dim('↻ retry $attempt/${config.maxAttempts} for '
+          '#${issue.number} — feeding the failing logs back to the agent.')}',
+        );
+        await git.resetHard(baseline);
+      }
+
+      _phase(
+        HarnessPhase.implement,
+        '#${issue.number} ${issue.title}'
+        '${attempt > 1 ? ' (attempt $attempt/${config.maxAttempts})' : ''}',
+      );
+      events.event(
+        'IMPLEMENT',
+        prd: prdRef,
+        issue: issue.number,
+        detail: 'attempt=$attempt/${config.maxAttempts}',
+      );
+      final run = await _runWithApiRetry(
+        () => claude.implement(
+          model: config.model,
+          prompt: prompts.implementer(
+            issue: issue,
+            comments: comments,
+            retry: retry,
+          ),
+        ),
+        'Implement #${issue.number}',
+      );
+      _prdCostUsd += run.result?.costUsd ?? 0;
+      _abortIfFatal(run, 'Implement #${issue.number}');
+      implementSummary = run.result == null
+          ? ''
+          : '\n\nImplement: ${run.result!.summary}.';
+      print('');
+
+      if (!await git.hasDrift()) {
+        // No uncommitted changes — current state may already satisfy the issue
+        // (e.g. a prior human commit resolved it), or the agent simply produced
+        // nothing this attempt. Gate it: green means done; otherwise retry.
+        analyzeOk = await _gate(HarnessPhase.analyze, [
+          'flutter',
+          'analyze',
+        ], _analyzeLog);
+        testOk = await _scopedTestGate(baseline, issue.number);
+        _logGates(prdRef, issue.number, analyzeOk: analyzeOk, testOk: testOk);
+        if (analyzeOk && testOk) {
+          await gh.closeIssue(
+            issue.number,
+            'No new changes needed — current state passes all gates '
+            '(analyze + scoped tests).$implementSummary',
+          );
+          events.event(
+            'CLOSE',
+            prd: prdRef,
+            issue: issue.number,
+            detail: 'no-changes-pass',
+          );
+          print('  ${ansi.green('✓')} #${issue.number} already done → closed.');
+          return true;
+        }
+        events.event(
+          'RETRY',
+          prd: prdRef,
+          issue: issue.number,
+          detail: 'no-changes attempt=$attempt/${config.maxAttempts}',
+        );
+        retry = _retryFeedback(
+          analyzeOk: analyzeOk,
+          testOk: testOk,
+          noChanges: true,
+        );
+        print(
+          '  ${ansi.red('No changes produced for #${issue.number} '
+          '(attempt $attempt/${config.maxAttempts}).')}',
+        );
+        continue;
+      }
+
+      _phase(HarnessPhase.commit, '#${issue.number}');
+      final committed = await git.commitAll(
+        'feat(#${issue.number}): ${issue.title}\n\n'
+        'Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>',
+      );
+      if (!committed) {
+        events.event('COMMIT_FAIL', prd: prdRef, issue: issue.number);
+        print('  ${ansi.red('commit failed for #${issue.number}')}');
+        return false;
+      }
+      events.event('COMMIT', prd: prdRef, issue: issue.number);
+
+      analyzeOk = await _gate(HarnessPhase.analyze, [
         'flutter',
         'analyze',
       ], _analyzeLog);
-      final testOk = await _scopedTestGate(baseline, issue.number);
+      testOk = await _scopedTestGate(baseline, issue.number);
+      _logGates(prdRef, issue.number, analyzeOk: analyzeOk, testOk: testOk);
+
       if (analyzeOk && testOk) {
         await gh.closeIssue(
           issue.number,
-          'No new changes needed — current state passes all gates '
-          '(analyze + scoped tests).$implementSummary',
+          'Verified by AFK loop on branch `${await git.currentBranch()}`: '
+          'analyze + scoped tests green.$implementSummary',
         );
-        print('  ${ansi.green('✓')} #${issue.number} already done → closed.');
+        events.event('CLOSE', prd: prdRef, issue: issue.number, detail: 'pass');
+        print('  ${ansi.green('✓ #${issue.number} PASS → closed.')}');
         return true;
       }
+
+      events.event(
+        'RETRY',
+        prd: prdRef,
+        issue: issue.number,
+        detail:
+            'attempt=$attempt/${config.maxAttempts} '
+            'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}',
+      );
+      retry = _retryFeedback(analyzeOk: analyzeOk, testOk: testOk);
       print(
-        '  ${ansi.red('No changes produced for #${issue.number} → FAIL.')}',
+        ansi.red(
+          '  #${issue.number} attempt $attempt/${config.maxAttempts} FAILED '
+          '(analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}).',
+        ),
       );
-      await gh.relabelForHuman(issue.number);
-      await gh.commentOnIssue(
-        issue.number,
-        'AFK loop produced no changes for this issue — needs human attention.',
-      );
-      return false;
     }
 
-    _phase(HarnessPhase.commit, '#${issue.number}');
-    final committed = await git.commitAll(
-      'feat(#${issue.number}): ${issue.title}\n\n'
-      'Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>',
+    // Every attempt failed — preserve the last try and hand off to a human.
+    events.event(
+      'FAIL',
+      prd: prdRef,
+      issue: issue.number,
+      detail:
+          'attempts=${config.maxAttempts} '
+          'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}',
     );
-    if (!committed) {
-      print('  ${ansi.red('commit failed for #${issue.number}')}');
-      return false;
-    }
-
-    final analyzeOk = await _gate(HarnessPhase.analyze, [
-      'flutter',
-      'analyze',
-    ], _analyzeLog);
-    final testOk = await _scopedTestGate(baseline, issue.number);
-
-    if (analyzeOk && testOk) {
-      await gh.closeIssue(
-        issue.number,
-        'Verified by AFK loop on branch `${await git.currentBranch()}`: '
-        'analyze + scoped tests green.$implementSummary',
-      );
-      print('  ${ansi.green('✓ #${issue.number} PASS → closed.')}');
-      return true;
-    }
-
     await git.tagFail(issue.number);
     await git.resetHard(baseline);
     await gh.relabelForHuman(issue.number);
@@ -411,11 +582,43 @@ class HarnessLoop {
     );
     print(
       ansi.red(
-        '  #${issue.number} FAIL → tagged ralph-fail/${issue.number}, '
-        'rolled back, relabeled ready-for-human.',
+        '  #${issue.number} FAIL after ${config.maxAttempts} attempt(s) → '
+        'tagged ralph-fail/${issue.number}, rolled back, '
+        'relabeled ready-for-human.',
       ),
     );
     return false;
+  }
+
+  /// The `{{RETRY}}` block fed to the implementer on a re-attempt: which gate
+  /// failed plus the tail of its log, so the agent fixes the real error instead
+  /// of repeating the same attempt blind.
+  String _retryFeedback({
+    required bool analyzeOk,
+    required bool testOk,
+    bool noChanges = false,
+  }) {
+    final sections = <String>[];
+    if (noChanges) {
+      sections.add(
+        'Your previous attempt produced NO file changes, yet the issue is not '
+        'satisfied. You must actually edit the code this time.',
+      );
+    }
+    if (!analyzeOk && File(_analyzeLog).existsSync()) {
+      sections.add(
+        '`fvm flutter analyze` FAILED:\n```\n${_tail(_analyzeLog, 40)}\n```',
+      );
+    }
+    if (!testOk && File(_testLog).existsSync()) {
+      sections.add(
+        '`fvm flutter test` FAILED:\n```\n${_tail(_testLog, 40)}\n```',
+      );
+    }
+    return '\n---\n## Previous attempt failed — fix these before finishing\n'
+        'A prior automated attempt at this exact issue did not pass the gates. '
+        'Treat the errors below as the source of truth and resolve every one '
+        'of them.\n\n${sections.join('\n\n')}\n';
   }
 
   /// The per-issue test gate: runs only the tests the slice's diff scopes to
@@ -440,6 +643,26 @@ class HarnessLoop {
     return _gate(HarnessPhase.test, ['flutter', 'test', ...scoped], _testLog);
   }
 
+  void _logGates(
+    int? prd,
+    int? issue, {
+    required bool analyzeOk,
+    required bool testOk,
+  }) {
+    events.event(
+      'ANALYZE',
+      prd: prd,
+      issue: issue,
+      detail: analyzeOk ? 'pass' : 'fail',
+    );
+    events.event(
+      'TEST',
+      prd: prd,
+      issue: issue,
+      detail: testOk ? 'pass' : 'fail',
+    );
+  }
+
   Future<bool> _gate(
     HarnessPhase phase,
     List<String> arguments,
@@ -459,6 +682,11 @@ class HarnessLoop {
     final openSubs = await _openSubsOf(activeParent);
     if (openSubs.isNotEmpty || ahead == 0) {
       final refs = openSubs.map((i) => '#${i.number}').join(', ');
+      events.event(
+        'PR_SKIP',
+        prd: activeParent,
+        detail: 'open_subs=${openSubs.length} commits_ahead=$ahead',
+      );
       print(
         '  PRD #$activeParent not PR\'d '
         '(open_subs=${openSubs.length}${refs.isEmpty ? '' : ' [$refs]'}, '
@@ -471,6 +699,7 @@ class HarnessLoop {
     final title = await gh.issueTitle(activeParent);
     final branch = await git.currentBranch();
     if (!await git.pushBranch(branch)) {
+      events.event('PUSH_FAIL', prd: activeParent, detail: 'branch=$branch');
       print('  ${ansi.red('push failed for $branch; leaving for human.')}');
       return;
     }
@@ -487,7 +716,11 @@ class HarnessLoop {
           '🤖 Generated with [Claude Code](https://claude.com/claude-code)',
     );
     print('  PR: ${ansi.cyan(prUrl ?? '<none>')}');
-    if (prUrl == null) return;
+    if (prUrl == null) {
+      events.event('PR_OPEN_FAIL', prd: activeParent, detail: 'branch=$branch');
+      return;
+    }
+    events.event('PR_OPEN', prd: activeParent, detail: 'url=$prUrl');
 
     // PR gate: the whole suite, not the per-issue scoped subset. A red base
     // (pre-existing failures) keeps the PR a draft for a human — work is never
@@ -500,20 +733,29 @@ class HarnessLoop {
       'flutter',
       'test',
     ], _testLog);
+    _logGates(activeParent, null, analyzeOk: analyzeOk, testOk: testOk);
 
     _phase(HarnessPhase.review, 'PR #$activeParent');
-    final review = await claude.verify(
-      prompts.prVerifier(
-        activeParent,
-        title,
-        config.base,
-        repo: config.repo,
-        prRef: prUrl,
+    final review = await _runWithApiRetry(
+      () => claude.verify(
+        prompts.prVerifier(
+          activeParent,
+          title,
+          config.base,
+          repo: config.repo,
+          prRef: prUrl,
+        ),
       ),
+      'PR review #$activeParent',
     );
     _prdCostUsd += review.result?.costUsd ?? 0;
     _abortIfFatal(review, 'PR review #$activeParent');
     final verdict = review.transcript;
+    events.event(
+      'PR_REVIEW',
+      prd: activeParent,
+      detail: hasPassVerdict(verdict) ? 'pass' : 'fail',
+    );
     final reviewSummary = review.result == null
         ? ''
         : '\n\n_Review: ${review.result!.summary}._';
@@ -528,8 +770,16 @@ class HarnessLoop {
     );
     if (analyzeOk && testOk && hasPassVerdict(verdict)) {
       await gh.markPrReady(prUrl);
+      events.event('PR_READY', prd: activeParent);
       print('  ${ansi.green('✓ Full suite + PR review PASS → marked ready.')}');
     } else {
+      events.event(
+        'PR_DRAFT',
+        prd: activeParent,
+        detail:
+            'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0} '
+            'review=${hasPassVerdict(verdict) ? 1 : 0}',
+      );
       print(
         ansi.red(
           '  ✗ PR left as draft for human '

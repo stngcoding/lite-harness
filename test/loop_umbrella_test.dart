@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:dartralph/dartralph.dart';
 import 'package:test/test.dart';
 
@@ -191,13 +193,19 @@ const _config = Config(
   dryRun: false,
 );
 
-HarnessLoop _loop(FakeGh gh, FakeClaude claude, FakeGit git) => HarnessLoop(
+HarnessLoop _loop(
+  FakeGh gh,
+  FakeClaude claude,
+  FakeGit git, {
+  EventLog? events,
+}) => HarnessLoop(
   config: _config,
   gh: gh,
   git: git,
   claude: claude,
   proc: FakeProc(),
   prompts: _prompts(),
+  events: events,
 );
 
 void main() {
@@ -266,6 +274,45 @@ void main() {
       expect(boxes[263]!.open, isTrue);
       expect(boxes[264]!.open, isFalse);
       expect(boxes[265]!.open, isFalse);
+    });
+
+    test('event log records the PRD/issue sequence for the run', () async {
+      final boxes = {
+        263: Box(263, 'PRD', '', {'ready-for-agent'}, true),
+        264: Box(264, 'Slice1', '## Parent\n#263\n', {'ready-for-agent'}, true),
+        265: Box(265, 'Slice2', '## Parent\n#263\n\n## Blocked by\n#264\n', {
+          'ready-for-agent',
+        }, true),
+      };
+      final dir = Directory.systemTemp.createTempSync('ralph-loop-events');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final logPath = '${dir.path}/events.log';
+
+      await _loop(
+        FakeGh(boxes),
+        FakeClaude(),
+        FakeGit(drift: true),
+        events: EventLog(logPath),
+      ).run();
+
+      final lines = File(
+        logPath,
+      ).readAsLinesSync().where((l) => l.isNotEmpty).toList();
+      final names = lines.map((l) => l.split(' ')[1]).toList();
+
+      expect(names.first, 'START');
+      expect(names.last, 'DONE');
+      expect(names, contains('UMBRELLA_DROP'));
+      expect(names, containsAllInOrder(['IMPLEMENT', 'COMMIT', 'CLOSE']));
+      expect(names, containsAllInOrder(['PR_OPEN', 'PR_REVIEW', 'PR_READY']));
+      expect(
+        lines.firstWhere((l) => l.contains(' UMBRELLA_DROP ')),
+        contains('prd=263 issue=263'),
+      );
+      expect(
+        lines.firstWhere((l) => l.contains(' PR_OPEN ')),
+        contains('prd=263'),
+      );
     });
   });
 }

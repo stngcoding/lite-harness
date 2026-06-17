@@ -2,6 +2,7 @@
 {{LABELS}}
 {{ISSUE_BODY}}
 {{COMMENTS}}
+{{RETRY}}
 ---
 You are an expert Flutter/Dart engineer. Implement the issue above, end to end, so that every acceptance criterion in its description and comments is satisfied. Work the two phases below in order; do not skip a phase.
 

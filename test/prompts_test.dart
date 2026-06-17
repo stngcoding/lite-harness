@@ -7,7 +7,7 @@ import 'package:test/test.dart';
 // the file-backed prompts reproduce these byte-for-byte (modulo incidental
 // leading/trailing whitespace), locking the default prompt text against
 // accidental drift while leaving per-repo overrides free to diverge.
-String _expectedImplementer(Issue issue, String comments) {
+String _expectedImplementer(Issue issue, String comments, [String retry = '']) {
   final labels = issue.labels.join(', ');
   final body = issue.body.isEmpty ? '(no description provided)' : issue.body;
   return '''
@@ -15,6 +15,7 @@ String _expectedImplementer(Issue issue, String comments) {
 ${labels.isEmpty ? '' : 'Labels: $labels\n'}
 $body
 ${comments.isEmpty ? '' : '\n### Comments\n$comments\n'}
+$retry
 ---
 You are an expert Flutter/Dart engineer. Implement the issue above, end to end, so that every acceptance criterion in its description and comments is satisfied. Work the two phases below in order; do not skip a phase.
 

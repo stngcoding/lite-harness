@@ -64,6 +64,7 @@ class PromptLibrary {
     'LABELS',
     'ISSUE_BODY',
     'COMMENTS',
+    'RETRY',
   };
   static const _verifierVars = {
     'ISSUE_NUMBER',
@@ -115,7 +116,11 @@ class PromptLibrary {
     return File.fromUri(uri).readAsString();
   }
 
-  String implementer({required Issue issue, required String comments}) {
+  String implementer({
+    required Issue issue,
+    required String comments,
+    String retry = '',
+  }) {
     final labels = issue.labels.join(', ');
     return _implementer.render({
       'ISSUE_NUMBER': '${issue.number}',
@@ -125,6 +130,7 @@ class PromptLibrary {
           ? '(no description provided)'
           : issue.body,
       'COMMENTS': comments.isEmpty ? '' : '\n### Comments\n$comments\n',
+      'RETRY': retry,
     });
   }
 

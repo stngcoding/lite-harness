@@ -1,7 +1,18 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:args/args.dart';
 import 'package:dartralph/dartralph.dart';
+
+/// A fresh debug log per run under `/tmp`, e.g. `/tmp/dartralph-20260616-153000.log`.
+/// Mirrors the convention of the gate logs (`/tmp/ralph-*.log`).
+String _debugLogPath() {
+  final n = DateTime.now();
+  String p(int v) => v.toString().padLeft(2, '0');
+  final stamp =
+      '${n.year}${p(n.month)}${p(n.day)}-${p(n.hour)}${p(n.minute)}${p(n.second)}';
+  return '/tmp/dartralph-$stamp.log';
+}
 
 ArgParser _buildParser() => ArgParser()
   ..addOption(
@@ -25,6 +36,12 @@ ArgParser _buildParser() => ArgParser()
     abbr: 'i',
     help: 'Stop after processing N sub-issues.',
   )
+  ..addOption(
+    'max-attempts',
+    help:
+        'Re-implement a failing sub-issue up to N times before handing it to '
+        'a human (default: 3, env MAX_ATTEMPTS).',
+  )
   ..addFlag(
     'once',
     negatable: false,
@@ -47,6 +64,20 @@ void _usage(ArgParser parser, IOSink sink) {
 }
 
 Future<void> main(List<String> arguments) async {
+  final debugLogPath = _debugLogPath();
+  final logFile = File(debugLogPath)..writeAsStringSync('');
+  await runZoned(
+    () => _run(arguments, debugLogPath),
+    zoneSpecification: ZoneSpecification(
+      print: (self, parent, zone, line) {
+        parent.print(zone, line);
+        logFile.writeAsStringSync('$line\n', mode: FileMode.append);
+      },
+    ),
+  );
+}
+
+Future<void> _run(List<String> arguments, String debugLogPath) async {
   final parser = _buildParser();
   final ArgResults options;
   try {
@@ -88,6 +119,19 @@ Future<void> main(List<String> arguments) async {
   }
 
   final env = Platform.environment;
+  final maxAttemptsArg =
+      options['max-attempts'] as String? ?? env['MAX_ATTEMPTS'];
+  var maxAttempts = 3;
+  if (maxAttemptsArg != null) {
+    final parsed = int.tryParse(maxAttemptsArg);
+    if (parsed == null || parsed < 1) {
+      stderr.writeln(
+        '--max-attempts expects a positive integer, got "$maxAttemptsArg".',
+      );
+      exit(64);
+    }
+    maxAttempts = parsed;
+  }
   final ansi = Ansi.forStdout();
   final proc = ProcessRunner();
   final repo =
@@ -108,6 +152,7 @@ Future<void> main(List<String> arguments) async {
     dryRun: options['dry-run'] as bool,
     iterations: iterations,
     issueNumber: issueNumber,
+    maxAttempts: maxAttempts,
   );
 
   final PromptLibrary prompts;
@@ -128,9 +173,16 @@ Future<void> main(List<String> arguments) async {
     }
   }
 
+  final eventsLogPath = debugLogPath.replaceFirst(
+    RegExp(r'\.log$'),
+    '-events.log',
+  );
+
   print('Repo:  ${config.repo}');
   print('State: ${config.state}');
   print('Base:  ${config.base}');
+  print('Debug log:  $debugLogPath');
+  if (!config.dryRun) print('Events log: $eventsLogPath');
   print('');
 
   final loop = HarnessLoop(
@@ -140,6 +192,7 @@ Future<void> main(List<String> arguments) async {
     claude: ClaudeRunner(proc, ansi: ansi),
     proc: proc,
     prompts: prompts,
+    events: config.dryRun ? null : EventLog(eventsLogPath),
     ansi: ansi,
   );
   exit(await loop.run());

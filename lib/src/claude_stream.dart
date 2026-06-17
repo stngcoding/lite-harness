@@ -63,6 +63,17 @@ class ResultEvent extends StreamEvent {
   bool get isFatal =>
       subtype == 'error_during_execution' || (isError && subtype == 'success');
 
+  /// Whether a fatal run is *transient* — an error thrown mid-execution (an
+  /// exhausted internal API retry) or an overloaded/5xx status — so retrying the
+  /// same `claude` run after a backoff can recover. Auth/billing statuses
+  /// (401/402/403) are never transient: every retry fails the same way.
+  bool get isTransientApi {
+    final status = apiErrorStatus;
+    if (status == 401 || status == 402 || status == 403) return false;
+    if (subtype == 'error_during_execution') return true;
+    return status != null && status >= 500;
+  }
+
   /// A human-readable error string for an errored run, e.g.
   /// `error_during_execution [HTTP 529]: Overloaded`.
   String get errorMessage {
