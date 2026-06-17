@@ -87,6 +87,7 @@ class FakeClaude extends ClaudeRunner {
   Future<ClaudeRun> implement({
     required String model,
     required String prompt,
+    String systemAppend = '',
   }) async {
     prompts.add(prompt);
     return const ClaudeRun(transcript: '', result: _okResult);

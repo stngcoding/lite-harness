@@ -24,6 +24,7 @@ class HarnessLoop {
     required this.claude,
     required this.proc,
     required this.prompts,
+    this.rulesSystemPrompt = '',
     EventLog? events,
     Ansi? ansi,
     this.apiRetryBackoff = const [
@@ -40,6 +41,13 @@ class HarnessLoop {
   final ClaudeRunner claude;
   final ProcessRunner proc;
   final PromptLibrary prompts;
+
+  /// Target-repo `.claude/rules/*.md`, flattened into one blob and injected into
+  /// the implementer's system prompt via `--append-system-prompt`. Loaded once
+  /// at startup; `''` when the target ships no root-level rules. See
+  /// `loadRulesSystemPrompt` (`rules.dart`).
+  final String rulesSystemPrompt;
+
   final EventLog events;
   final Ansi ansi;
 
@@ -468,6 +476,7 @@ class HarnessLoop {
             comments: comments,
             retry: retry,
           ),
+          systemAppend: rulesSystemPrompt,
         ),
         'Implement #${issue.number}',
       );

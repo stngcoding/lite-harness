@@ -95,6 +95,7 @@ class FlakyClaude extends ClaudeRunner {
   Future<ClaudeRun> implement({
     required String model,
     required String prompt,
+    String systemAppend = '',
   }) async {
     calls++;
     if (transient > 0) {

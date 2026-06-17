@@ -54,21 +54,19 @@ class ClaudeAbort implements Exception {
 }
 
 class ClaudeRunner {
-  ClaudeRunner(this._proc, {Ansi? ansi, this.maxLines = 2})
-    : _ansi = ansi ?? Ansi.forStdout();
+  ClaudeRunner(this._proc, {Ansi? ansi}) : _ansi = ansi ?? Ansi.forStdout();
 
   final ProcessRunner _proc;
   final Ansi _ansi;
 
-  /// Max lines shown per streamed agent text block (see [StreamRenderer]).
-  final int maxLines;
-
   Future<ClaudeRun> implement({
     required String model,
     required String prompt,
+    String systemAppend = '',
   }) => _run([
     '--model',
     model,
+    if (systemAppend.isNotEmpty) ...['--append-system-prompt', systemAppend],
     '--dangerously-skip-permissions',
     '--output-format',
     'stream-json',
@@ -89,7 +87,7 @@ class ClaudeRunner {
   ]);
 
   Future<ClaudeRun> _run(List<String> arguments) async {
-    final renderer = StreamRenderer(ansi: _ansi, maxLines: maxLines);
+    final renderer = StreamRenderer(ansi: _ansi);
     await _proc.stream('claude', arguments, onLine: renderer.onLine);
     return ClaudeRun(
       transcript: renderer.transcript,

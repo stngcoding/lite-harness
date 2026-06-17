@@ -196,6 +196,11 @@ Future<void> _run(List<String> arguments, String debugLogPath) async {
     }
   }
 
+  final rules = await loadRulesSystemPrompt();
+  for (final name in rules.files) {
+    print('Injecting .claude/rules/$name → implementer system prompt');
+  }
+
   final eventsLogPath = debugLogPath.replaceFirst(
     RegExp(r'\.log$'),
     '-events.log',
@@ -215,6 +220,7 @@ Future<void> _run(List<String> arguments, String debugLogPath) async {
     claude: ClaudeRunner(proc, ansi: ansi),
     proc: proc,
     prompts: prompts,
+    rulesSystemPrompt: rules.text,
     events: config.dryRun ? null : EventLog(eventsLogPath),
     ansi: ansi,
   );
