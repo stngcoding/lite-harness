@@ -8,6 +8,7 @@ class Config {
     this.iterations,
     this.issueNumber,
     this.maxAttempts = 3,
+    this.splitThreshold = 800,
   });
 
   final String repo;
@@ -24,4 +25,9 @@ class Config {
   /// gives up and hands it to a human. Each retry feeds the failing analyze /
   /// test logs back to the implementer so it can fix forward.
   final int maxAttempts;
+
+  /// When a PRD's diff exceeds this many changed lines (insertions + deletions),
+  /// it is opened as a chain of stacked PRs instead of one — cut at sub-issue
+  /// commit boundaries so each PR stays small enough to review comfortably.
+  final int splitThreshold;
 }

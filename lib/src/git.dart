@@ -103,4 +103,40 @@ class GitOps {
     final count = await _out(['rev-list', '--count', 'origin/$base..HEAD']);
     return int.tryParse(count) ?? 0;
   }
+
+  /// Commit SHAs on the current branch ahead of `origin/<base>`, oldest first —
+  /// one per landed slice. Used to carve a large PRD into stacked-PR chunks.
+  Future<List<String>> commitLog(String base) async {
+    final out = await _out([
+      'log',
+      '--format=%H',
+      '--reverse',
+      'origin/$base..HEAD',
+    ]);
+    if (out.isEmpty) return const [];
+    return out
+        .split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+  }
+
+  /// Lines changed (insertions + deletions) between [from] and [to], read from
+  /// `git diff --shortstat`. Returns 0 when the diff is empty or unparseable
+  /// (e.g. binary-only), so an indeterminate commit never forces a spurious
+  /// chunk boundary.
+  Future<int> diffLineDelta(String from, String to) async {
+    final out = await _out(['diff', '--shortstat', from, to]);
+    var total = 0;
+    for (final m in RegExp(r'(\d+) (insertion|deletion)').allMatches(out)) {
+      total += int.parse(m.group(1)!);
+    }
+    return total;
+  }
+
+  /// Creates or moves [branch] to [sha] and checks it out (`git checkout -B`).
+  /// Carves a stacked-PR chunk branch at a commit boundary on the existing
+  /// linear history without rewriting it.
+  Future<bool> checkoutNewAt(String branch, String sha) =>
+      _succeeds(['checkout', '-B', branch, sha]);
 }
