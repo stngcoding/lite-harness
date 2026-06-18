@@ -1010,7 +1010,18 @@ class HarnessLoop {
 
       final existing = await gh.openPrForBranch(branch);
       if (existing != null) {
-        print('  PR ${i + 1}/$total exists: ${ansi.cyan(existing)}');
+        // Enforce the intended base on a reused PR. A chunk PR already carries
+        // the right base (no-op), but a single big PR left on the canonical
+        // branch (base `config.base`, whole-PRD diff) is re-based onto the
+        // previous chunk — shrinking it into the final stacked chunk instead of
+        // lingering alongside the smaller chunk PRs.
+        await gh.editPr(
+          existing,
+          base: base,
+          title: 'PRD #$activeParent [${i + 1}/$total]: $title',
+        );
+        final note = isLast ? ' ${ansi.dim('(re-based)')}' : '';
+        print('  PR ${i + 1}/$total exists: ${ansi.cyan(existing)}$note');
         targets.add(
           _PrTarget(url: existing, baseRef: base, headBranch: branch),
         );

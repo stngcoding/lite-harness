@@ -268,6 +268,16 @@ class GhCli {
   Future<void> markPrReady(String ref) =>
       _quiet(['pr', 'ready', ref, '--repo', repo]);
 
+  Future<void> editPr(String ref, {String? base, String? title}) => _quiet([
+    'pr',
+    'edit',
+    ref,
+    '--repo',
+    repo,
+    if (base != null) ...['--base', base],
+    if (title != null) ...['--title', title],
+  ]);
+
   Future<void> _quiet(List<String> arguments) async {
     await _proc.run('gh', arguments);
   }
