@@ -51,6 +51,48 @@ class GhCli {
     }
   }
 
+  /// Metadata for [ref] (a PR number or URL), or null when no such PR exists.
+  /// [base]/[head] are the branch names; [url] is the canonical PR ref the rest
+  /// of the harness comments on and marks ready.
+  Future<({int number, String title, String head, String base, String url})?>
+  prInfo(String ref) async {
+    final result = await _proc.run('gh', [
+      'pr',
+      'view',
+      ref,
+      '--repo',
+      repo,
+      '--json',
+      'number,title,headRefName,baseRefName,url',
+    ]);
+    if (!result.ok) return null;
+    try {
+      final json = jsonDecode(result.stdout) as Map<String, dynamic>;
+      return (
+        number: json['number'] as int,
+        title: json['title'] as String,
+        head: json['headRefName'] as String,
+        base: json['baseRefName'] as String,
+        url: json['url'] as String,
+      );
+    } on FormatException {
+      return null;
+    }
+  }
+
+  /// Checks out [ref]'s head branch locally (handles forks and remote-only
+  /// branches via `gh pr checkout`). Returns false when the checkout failed.
+  Future<bool> checkoutPr(String ref) async {
+    final result = await _proc.run('gh', [
+      'pr',
+      'checkout',
+      ref,
+      '--repo',
+      repo,
+    ]);
+    return result.ok;
+  }
+
   /// URL of the open PR whose head is [branch], or null when none exists.
   Future<String?> openPrForBranch(String branch) async {
     final result = await _proc.run('gh', [

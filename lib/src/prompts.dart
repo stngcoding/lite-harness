@@ -64,6 +64,7 @@ class PromptLibrary {
     'LABELS',
     'ISSUE_BODY',
     'COMMENTS',
+    'RETRY',
   };
   static const _verifierVars = {
     'ISSUE_NUMBER',
@@ -79,6 +80,7 @@ class PromptLibrary {
     'BASE',
     'REPO',
     'PR_REF',
+    'STACK_NOTE',
   };
 
   static Future<PromptLibrary> load({Directory? repoRoot}) async {
@@ -115,7 +117,11 @@ class PromptLibrary {
     return File.fromUri(uri).readAsString();
   }
 
-  String implementer({required Issue issue, required String comments}) {
+  String implementer({
+    required Issue issue,
+    required String comments,
+    String retry = '',
+  }) {
     final labels = issue.labels.join(', ');
     return _implementer.render({
       'ISSUE_NUMBER': '${issue.number}',
@@ -125,6 +131,7 @@ class PromptLibrary {
           ? '(no description provided)'
           : issue.body,
       'COMMENTS': comments.isEmpty ? '' : '\n### Comments\n$comments\n',
+      'RETRY': retry,
     });
   }
 
@@ -148,11 +155,25 @@ class PromptLibrary {
     String base, {
     required String repo,
     required String prRef,
-  }) => _prVerifier.render({
-    'PARENT_NUMBER': '$parent',
-    'PARENT_TITLE': title,
-    'BASE': base,
-    'REPO': repo,
-    'PR_REF': prRef,
-  });
+    int? chunkIndex,
+    int? chunkTotal,
+  }) {
+    final stackNote = chunkIndex == null || chunkTotal == null
+        ? 'Judge the PRD as a whole: the slices must fit together with no '
+              'contradictions or integration gaps, and satisfy the PRD\'s intent.'
+        : 'This PR is chunk $chunkIndex/$chunkTotal of a stacked split of one '
+              'PRD; the range is ONLY this chunk\'s slice. Earlier chunks are '
+              'already in its base and later chunks build on top, so review just '
+              'this slice and do NOT flag incompleteness that a later chunk '
+              'resolves (a symbol defined here and used later, a feature '
+              'finished in a later chunk).';
+    return _prVerifier.render({
+      'PARENT_NUMBER': '$parent',
+      'PARENT_TITLE': title,
+      'BASE': base,
+      'REPO': repo,
+      'PR_REF': prRef,
+      'STACK_NOTE': stackNote,
+    });
+  }
 }

@@ -35,4 +35,38 @@ void main() {
       );
     });
   });
+
+  group('reviewComment', () {
+    test('keeps only the block under the last review heading', () {
+      const transcript =
+          'Any repo-wide skill-evaluation preamble does NOT apply. Skip it.\n'
+          'Spawning triage and the five-lens panel...\n'
+          '### Code review\n\n'
+          'No blocking issues found.\n\n'
+          'VERDICT: PASS';
+      final out = reviewComment(transcript);
+      expect(out, startsWith('### Code review'));
+      expect(out, contains('No blocking issues found.'));
+      expect(out, contains('VERDICT: PASS'));
+      // The intermediate narration — including the skill-eval line — is dropped.
+      expect(out, isNot(contains('skill-evaluation')));
+      expect(out, isNot(contains('Spawning triage')));
+    });
+
+    test('slices from the last heading when one appears in narration', () {
+      const transcript =
+          'I will format my answer under a `### Code review` heading.\n'
+          '### Code review\n\n'
+          'Found 1 issue: ...\n'
+          'VERDICT: FAIL';
+      final out = reviewComment(transcript);
+      expect(out, startsWith('### Code review'));
+      expect(out, contains('Found 1 issue'));
+      expect(out, isNot(contains('I will format')));
+    });
+
+    test('falls back to the trimmed transcript when no heading exists', () {
+      expect(reviewComment('  oops, errored out  '), 'oops, errored out');
+    });
+  });
 }

@@ -13,6 +13,16 @@ class AssistantTextEvent extends StreamEvent {
   final String text;
 }
 
+/// An extended-thinking block. Shown live in full (it is the agent's reasoning,
+/// useful for AFK watchers) but kept OUT of the transcript: the verdict protocol
+/// reads the transcript, and a stray `VERDICT:` line in reasoning must never be
+/// mistaken for the real verdict.
+class AssistantThinkingEvent extends StreamEvent {
+  const AssistantThinkingEvent(this.text);
+
+  final String text;
+}
+
 class ToolUseEvent extends StreamEvent {
   const ToolUseEvent(this.name, this.summary);
 
@@ -62,6 +72,17 @@ class ResultEvent extends StreamEvent {
   /// per-task failure like `error_max_turns` is deliberately NOT fatal.
   bool get isFatal =>
       subtype == 'error_during_execution' || (isError && subtype == 'success');
+
+  /// Whether a fatal run is *transient* — an error thrown mid-execution (an
+  /// exhausted internal API retry) or an overloaded/5xx status — so retrying the
+  /// same `claude` run after a backoff can recover. Auth/billing statuses
+  /// (401/402/403) are never transient: every retry fails the same way.
+  bool get isTransientApi {
+    final status = apiErrorStatus;
+    if (status == 401 || status == 402 || status == 403) return false;
+    if (subtype == 'error_during_execution') return true;
+    return status != null && status >= 500;
+  }
 
   /// A human-readable error string for an errored run, e.g.
   /// `error_during_execution [HTTP 529]: Overloaded`.
@@ -162,6 +183,9 @@ List<StreamEvent> parseStreamJsonLine(String line) {
           {'type': 'text', 'text': final String text} => [
             AssistantTextEvent(text),
           ],
+          {'type': 'thinking', 'thinking': final String text} => [
+            AssistantThinkingEvent(text),
+          ],
           {'type': 'tool_use', 'name': final String name} => [
             ToolUseEvent(name, _summarizeInput(block['input'])),
           ],
@@ -224,31 +248,13 @@ String _summarizeInput(Object? input) {
 String _truncate(String text, int max) =>
     text.length <= max ? text : '${text.substring(0, max - 1)}…';
 
-/// Trims [text] to at most [max] lines for *display*. When lines are dropped the
-/// last kept line is flagged with a `… (+N more)` marker, so the output stays
-/// within [max] lines. The full text is preserved separately in the transcript
-/// (the verdict protocol reads from there) — this only shrinks the terminal
-/// noise of a live agent run.
-String clampLines(String text, int max) {
-  if (max <= 0) return '';
-  final lines = text.split('\n');
-  if (lines.length <= max) return text;
-  final shown = lines.take(max).toList();
-  final hidden = lines.length - max;
-  shown[shown.length - 1] = '${shown.last} … (+$hidden more)';
-  return shown.join('\n');
-}
-
 class StreamRenderer {
-  StreamRenderer({IOSink? sink, Ansi? ansi, this.maxLines = 2})
+  StreamRenderer({IOSink? sink, Ansi? ansi})
     : _sink = sink ?? stdout,
       _ansi = ansi ?? Ansi.forStdout();
 
   final IOSink _sink;
   final Ansi _ansi;
-
-  /// Max lines shown per streamed text block. The transcript keeps everything.
-  final int maxLines;
 
   final StringBuffer _transcript = StringBuffer();
 
@@ -272,11 +278,12 @@ class StreamRenderer {
       switch (event) {
         case AssistantTextEvent(:final text):
           _transcript.writeln(text);
-          final shown = clampLines(text, maxLines);
-          if (shown.trim().isNotEmpty) _sink.writeln(shown);
+          if (text.trim().isNotEmpty) _sink.writeln(text);
+        case AssistantThinkingEvent(:final text):
+          if (text.trim().isNotEmpty) _sink.writeln(_ansi.dimCyan('💭 $text'));
         case ToolUseEvent(:final name, :final summary):
           final label = summary.isEmpty ? name : '$name — $summary';
-          _sink.writeln(_ansi.dim('  ⚒ $label'));
+          _sink.writeln(_ansi.dimMagenta('  ⚒ $label'));
         case ResultEvent():
           _result = event;
           final tone = event.isError ? _ansi.red : _ansi.dim;

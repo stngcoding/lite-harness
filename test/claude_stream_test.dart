@@ -24,6 +24,15 @@ void main() {
       expect((events.single as AssistantTextEvent).text, 'Hello');
     });
 
+    test('extracts thinking blocks', () {
+      final events = parseStreamJsonLine(
+        '{"type":"assistant","message":{"content":'
+        '[{"type":"thinking","thinking":"Let me reason"}]}}',
+      );
+      expect(events, hasLength(1));
+      expect((events.single as AssistantThinkingEvent).text, 'Let me reason');
+    });
+
     test('extracts tool_use blocks with a brief input summary', () {
       final events = parseStreamJsonLine(
         '{"type":"assistant","message":{"content":'
@@ -180,50 +189,45 @@ void main() {
     });
   });
 
-  group('clampLines', () {
-    test('returns text unchanged when within the limit', () {
-      expect(clampLines('one\ntwo', 2), 'one\ntwo');
-      expect(clampLines('only', 2), 'only');
-    });
-
-    test('keeps max lines and flags the elided remainder', () {
-      final clamped = clampLines('l1\nl2\nl3\nl4', 2);
-      expect(clamped.split('\n'), hasLength(2));
-      expect(clamped, startsWith('l1\nl2'));
-      expect(clamped, contains('(+2 more)'));
-      expect(clamped, isNot(contains('l3')));
-    });
-
-    test('a non-positive limit yields no display text', () {
-      expect(clampLines('whatever', 0), isEmpty);
-    });
-  });
-
   group('StreamRenderer', () {
+    test('displays text blocks in full, unclamped', () {
+      final sink = _CapturingSink();
+      final renderer = StreamRenderer(
+        sink: sink,
+        ansi: const Ansi(enabled: false),
+      );
+      renderer.onLine(
+        '{"type":"assistant","message":{"content":'
+        '[{"type":"text","text":"l1\\nl2\\nl3\\nl4"}]}}',
+      );
+
+      // Every line reaches both the transcript and the terminal — no elision.
+      final shown = sink.buffer.toString();
+      for (final line in ['l1', 'l2', 'l3', 'l4']) {
+        expect(renderer.transcript, contains(line));
+        expect(shown, contains(line));
+      }
+      expect(shown, isNot(contains('more)')));
+    });
+
     test(
-      'display clamps to maxLines while the transcript keeps everything',
+      'shows thinking blocks in full but keeps them out of the transcript',
       () {
         final sink = _CapturingSink();
         final renderer = StreamRenderer(
           sink: sink,
           ansi: const Ansi(enabled: false),
-          maxLines: 2,
         );
         renderer.onLine(
           '{"type":"assistant","message":{"content":'
-          '[{"type":"text","text":"l1\\nl2\\nl3\\nl4"}]}}',
+          '[{"type":"thinking","thinking":"t1\\nt2\\nt3"}]}}',
         );
 
-        // Verdict reads the transcript — it must stay complete.
-        expect(renderer.transcript, contains('l3'));
-        expect(renderer.transcript, contains('l4'));
-
-        // The terminal only sees the first two lines plus an elision marker.
         final shown = sink.buffer.toString();
-        expect(shown, contains('l1'));
-        expect(shown, contains('l2'));
-        expect(shown, isNot(contains('l4')));
-        expect(shown, contains('(+2 more)'));
+        expect(shown, contains('t1'));
+        expect(shown, contains('t3'));
+        // Reasoning must never pollute the transcript the verdict reads.
+        expect(renderer.transcript, isEmpty);
       },
     );
   });

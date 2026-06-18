@@ -12,19 +12,31 @@ class ClaudeRun {
   final ResultEvent? result;
   final RateLimitEvent? rateLimited;
 
-  /// A message describing a condition that makes continuing the loop pointless
-  /// — rate limit, auth/billing failure, an exhausted API retry, or a streaming
-  /// break that killed the process before a `result` arrived. Null when the run
-  /// finished in a way the loop can recover from (success, or a per-task failure
-  /// like `error_max_turns` or bad code that the gates catch).
-  String? get fatalError {
-    if (rateLimited != null) return rateLimited!.summary;
+  /// A *transient* API failure the loop can recover from by retrying the same
+  /// `claude` run after a backoff — an overloaded/5xx status, a dropped stream
+  /// that killed the process before a `result` arrived, or an exhausted internal
+  /// API retry. Null when the run is fine or the failure is hard (rate limit,
+  /// auth, billing — see [fatalError]).
+  String? get transientApiError {
+    if (rateLimited != null) return null;
     final r = result;
     if (r == null) {
       return 'claude exited without a result event '
           '(streaming or process failure)';
     }
-    if (r.isFatal) return r.errorMessage;
+    if (r.isFatal && r.isTransientApi) return r.errorMessage;
+    return null;
+  }
+
+  /// A *hard*, unrecoverable condition — rate limit, auth/billing failure —
+  /// where every retry would fail the same way, so the loop must abort. A
+  /// transient API failure is [transientApiError] instead; a per-task failure
+  /// like `error_max_turns` or bad code the gates catch is neither.
+  String? get fatalError {
+    if (rateLimited != null) return rateLimited!.summary;
+    final r = result;
+    if (r == null) return null;
+    if (r.isFatal && !r.isTransientApi) return r.errorMessage;
     return null;
   }
 }
@@ -42,21 +54,19 @@ class ClaudeAbort implements Exception {
 }
 
 class ClaudeRunner {
-  ClaudeRunner(this._proc, {Ansi? ansi, this.maxLines = 2})
-    : _ansi = ansi ?? Ansi.forStdout();
+  ClaudeRunner(this._proc, {Ansi? ansi}) : _ansi = ansi ?? Ansi.forStdout();
 
   final ProcessRunner _proc;
   final Ansi _ansi;
 
-  /// Max lines shown per streamed agent text block (see [StreamRenderer]).
-  final int maxLines;
-
   Future<ClaudeRun> implement({
     required String model,
     required String prompt,
+    String systemAppend = '',
   }) => _run([
     '--model',
     model,
+    if (systemAppend.isNotEmpty) ...['--append-system-prompt', systemAppend],
     '--dangerously-skip-permissions',
     '--output-format',
     'stream-json',
@@ -77,7 +87,7 @@ class ClaudeRunner {
   ]);
 
   Future<ClaudeRun> _run(List<String> arguments) async {
-    final renderer = StreamRenderer(ansi: _ansi, maxLines: maxLines);
+    final renderer = StreamRenderer(ansi: _ansi);
     await _proc.stream('claude', arguments, onLine: renderer.onLine);
     return ClaudeRun(
       transcript: renderer.transcript,

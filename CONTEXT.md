@@ -123,7 +123,7 @@ See `test/` directory.
 - **Deterministic retries** — failed issues tagged (`ralph-fail/<n>`), rolled back, relabeled for human review
 - **Single PR per PRD** — all sub-issues in a PRD are collected into one branch/PR
 - **Base branch configurable** — default `dev`; set via `--base` or `BASE` env var
-- **Model configurable** — default `sonnet`; set via `--model` or `MODEL` env var
+- **Model configurable** — default `opus`; set via `--model` or `MODEL` env var
 - **Dry-run mode** — prints PRD/sub-issue order without making changes
 - **Issue number filter** — `--issue N` processes only issue N, then exits
 - **One-shot mode** — `--once` processes exactly one sub-issue, then exits
