@@ -524,12 +524,38 @@ class HarnessLoop {
     return byNumber.values.toList();
   }
 
+  /// Cross-slice context for the implementer: the parent PRD's title+body plus a
+  /// roster of the sibling slices still in flight. Empty for a PRD-of-one (no
+  /// [parent]), so a standalone issue gets no noise. This is what lets the
+  /// implementer reconcile shared interfaces up front instead of leaving
+  /// cross-slice integration gaps for the single end-of-PRD review to drain.
+  Future<({String prdContext, String sliceMap})> _coherenceContext(
+    int? parent,
+    int self,
+  ) async {
+    if (parent == null) return (prdContext: '', sliceMap: '');
+    final title = await gh.issueTitle(parent);
+    final body = await gh.issueBody(parent);
+    final prdContext = StringBuffer('## PRD #$parent: $title');
+    if (body.isNotEmpty) prdContext.write('\n\n$body');
+    final siblings =
+        (await _openSubsOf(parent)).where((s) => s.number != self).toList()
+          ..sort((a, b) => a.number.compareTo(b.number));
+    final sliceMap = [
+      for (final s in siblings)
+        '- #${s.number} ${s.title}'
+            '${s.labels.contains('ready-for-human') ? ' (needs human)' : ''}',
+    ].join('\n');
+    return (prdContext: prdContext.toString(), sliceMap: sliceMap);
+  }
+
   Future<bool> _processSub(Issue issue) async {
     _handled.add(issue.number);
     final parent = parentOf(issue.body, issue.number);
     final prdRef = parent == issue.number ? null : parent;
     events.event('ISSUE_START', prd: prdRef, issue: issue.number);
     final comments = await gh.issueComments(issue.number);
+    final coherence = await _coherenceContext(prdRef, issue.number);
 
     final issuePhase = phaseOf(issue.body);
     const rule = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
@@ -577,6 +603,8 @@ class HarnessLoop {
           prompt: prompts.implementer(
             issue: issue,
             comments: comments,
+            prdContext: coherence.prdContext,
+            sliceMap: coherence.sliceMap,
             retry: retry,
           ),
           systemAppend: rulesSystemPrompt,

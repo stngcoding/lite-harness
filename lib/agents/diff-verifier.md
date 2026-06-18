@@ -51,6 +51,13 @@ These are NOT blocking, in either mode (treat as false positives):
   explicitly requires them.
 - A CLAUDE.md rule that the code explicitly silences (e.g. an ignore comment).
 - Changes that are intentional and part of the broader PRD.
+- A claim that the code mishandles an EXTERNAL data contract — an API field's
+  units or semantics, the server-side meaning of a value, what a response
+  actually returns — when its truth cannot be settled from this diff alone.
+  Matching or differing from *other code in the same repo* is NOT proof of the
+  external contract: sibling code can be wrong in the same direction, so
+  intra-repo consistency is never evidence of the external truth. Such a claim is
+  a `CONTRACT:` note to verify against the real contract, never grounds for FAIL.
 
 ---
 
@@ -127,12 +134,15 @@ actually calls the issue out specifically.
 
 ## 4. Filter and decide
 
-Drop every issue scored below **80**. Of the survivors, separate blocking
-issues (per the shared rule above) from high-confidence nits.
+Drop every issue scored below **80** — EXCEPT a `CONTRACT:`-tagged candidate
+(the scorer caps these, so they never clear 80 on their own). Never let a
+contract claim FAIL the PR; instead surface it once, verbatim, as a non-blocking
+"Verify against contract" note. Of the rest, separate blocking issues (per the
+shared rule above) from high-confidence nits.
 
 - Any surviving **blocking** issue → `VERDICT: FAIL`.
-- No surviving blocking issue → `VERDICT: PASS` (still report surviving nits as
-  non-blocking notes).
+- No surviving blocking issue → `VERDICT: PASS` (still report surviving nits and
+  any `CONTRACT:` verify-notes as non-blocking notes).
 
 ## 5. Write the review comment
 

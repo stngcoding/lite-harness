@@ -47,6 +47,15 @@ this rubric verbatim:
 For an issue flagged on CLAUDE.md grounds, first open the cited CLAUDE.md and
 confirm it calls out this specific issue; if it does not, the score is low.
 
+Hard cap for external-contract claims: if the issue asserts the code mishandles
+an EXTERNAL data contract — an API field's units or semantics, the server-side
+meaning of a value, what a response actually returns — and the only way you could
+confirm it is from *other code in this same repo* (no doc, schema, or fixture
+settles it), score it **at most 70** and prefix your reason with `CONTRACT:`.
+Sibling code can be wrong the same way, so intra-repo consistency is not
+confirmation. Score above 70 only with a source of truth outside the repo's own
+code (a contract doc, an API schema, a recorded response fixture).
+
 Return only:
 
 ```

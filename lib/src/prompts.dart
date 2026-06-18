@@ -59,6 +59,8 @@ class PromptLibrary {
   final PromptTemplate _prVerifier;
 
   static const _implementerVars = {
+    'PRD_CONTEXT',
+    'SLICE_MAP',
     'ISSUE_NUMBER',
     'ISSUE_TITLE',
     'LABELS',
@@ -120,10 +122,17 @@ class PromptLibrary {
   String implementer({
     required Issue issue,
     required String comments,
+    String prdContext = '',
+    String sliceMap = '',
     String retry = '',
   }) {
     final labels = issue.labels.join(', ');
     return _implementer.render({
+      'PRD_CONTEXT': prdContext.isEmpty ? '' : '$prdContext\n\n',
+      'SLICE_MAP': sliceMap.isEmpty
+          ? ''
+          : '\n### Sibling slices in this PRD (coordinate shared interfaces)\n'
+                '$sliceMap\n',
       'ISSUE_NUMBER': '${issue.number}',
       'ISSUE_TITLE': issue.title,
       'LABELS': labels.isEmpty ? '' : 'Labels: $labels\n',

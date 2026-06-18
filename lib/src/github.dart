@@ -176,6 +176,21 @@ class GhCli {
     return result.ok && title.isNotEmpty ? title : 'prd-$number';
   }
 
+  Future<String> issueBody(int number) async {
+    final result = await _proc.run('gh', [
+      'issue',
+      'view',
+      '$number',
+      '--repo',
+      repo,
+      '--json',
+      'body',
+      '-q',
+      '.body',
+    ]);
+    return result.ok ? result.stdout.trim() : '';
+  }
+
   Future<void> closeIssue(int number, String comment) async {
     await _quiet([
       'issue',
