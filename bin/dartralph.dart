@@ -49,6 +49,12 @@ ArgParser _buildParser() => ArgParser()
         '(insertions + deletions), cut at sub-issue commit boundaries '
         '(default: 800, env SPLIT_THRESHOLD).',
   )
+  ..addOption(
+    'review-pr',
+    help:
+        'Skip the implement loop and only review this PR (number or URL): full '
+        'suite + diff-verifier, comment the verdict, mark ready if green.',
+  )
   ..addFlag(
     'once',
     negatable: false,
@@ -176,6 +182,7 @@ Future<void> _run(List<String> arguments, String debugLogPath) async {
     issueNumber: issueNumber,
     maxAttempts: maxAttempts,
     splitThreshold: splitThreshold,
+    reviewPr: options['review-pr'] as String?,
   );
 
   final PromptLibrary prompts;

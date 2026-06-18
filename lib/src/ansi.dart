@@ -27,4 +27,6 @@ class Ansi {
   String cyan(String t) => _wrap('36', t);
   String dim(String t) => _wrap('2', t);
   String bold(String t) => _wrap('1', t);
+  String dimCyan(String t) => _wrap('2;36', t);
+  String dimMagenta(String t) => _wrap('2;35', t);
 }

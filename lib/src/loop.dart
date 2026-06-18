@@ -124,6 +124,11 @@ class HarnessLoop {
           '${config.issueNumber != null ? ' issue=${config.issueNumber}' : ''}',
     );
     try {
+      if (config.reviewPr != null) {
+        final code = await _reviewPr(config.reviewPr!);
+        events.event('DONE');
+        return code;
+      }
       if (config.issueNumber != null) {
         final code = await _runSingle(config.issueNumber!);
         events.event('DONE');
@@ -253,6 +258,104 @@ class HarnessLoop {
     _prdCostUsd = 0;
     final passed = await _processSub(issue);
     return passed ? 0 : 1;
+  }
+
+  /// `--review-pr`: skip the whole implement loop and review an existing PR.
+  /// Checks out the PR's head, runs the full suite + the holistic diff-verifier
+  /// over `origin/<pr-base>..HEAD`, comments the verdict, and marks the PR ready
+  /// only when the suite is green and the review passes (a red result just
+  /// comments and leaves the PR untouched). Returns 0 on a green verdict.
+  Future<int> _reviewPr(String prRef) async {
+    final info = await gh.prInfo(prRef);
+    if (info == null) {
+      stderr.writeln('PR $prRef not found in ${config.repo}.');
+      return 1;
+    }
+
+    const rule = '════════════════════════════════════════════════════';
+    print('');
+    print(ansi.cyan(rule));
+    _phase(HarnessPhase.checkout, 'PR #${info.number}');
+    print('  ${ansi.bold('PR #${info.number}')}: ${info.title}');
+    print('  Branch: ${ansi.cyan(info.head)} → base ${info.base}');
+    print(ansi.cyan(rule));
+
+    final parked = await git.parkDrift();
+    if (parked != null) print('  Parked uncommitted drift in stash: $parked');
+    if (!await gh.checkoutPr(prRef)) {
+      events.event('CHECKOUT_FAIL', prd: info.number, detail: 'pr=${info.url}');
+      stderr.writeln('  cannot checkout PR #${info.number}; aborting.');
+      return 1;
+    }
+    await git.fetch(info.base);
+    _prdCostUsd = 0;
+    events.event('PR_REVIEW_START', prd: info.number, detail: 'pr=${info.url}');
+
+    final analyzeOk = await _gate(HarnessPhase.analyze, [
+      'flutter',
+      'analyze',
+    ], _analyzeLog);
+    final testOk = await _gate(HarnessPhase.test, [
+      'flutter',
+      'test',
+    ], _testLog);
+    _logGates(info.number, null, analyzeOk: analyzeOk, testOk: testOk);
+
+    _phase(HarnessPhase.review, 'PR #${info.number}');
+    final review = await _runWithApiRetry(
+      () => claude.verify(
+        prompts.prVerifier(
+          info.number,
+          info.title,
+          info.base,
+          repo: config.repo,
+          prRef: info.url,
+        ),
+      ),
+      'PR review #${info.number}',
+    );
+    _prdCostUsd += review.result?.costUsd ?? 0;
+    _abortIfFatal(review, 'PR review #${info.number}');
+    final verdict = review.transcript;
+    events.event(
+      'PR_REVIEW',
+      prd: info.number,
+      detail: hasPassVerdict(verdict) ? 'pass' : 'fail',
+    );
+    final reviewSummary = review.result == null
+        ? ''
+        : '\n\n_Review: ${review.result!.summary}._';
+    final suiteLine =
+        'Full suite: analyze=${analyzeOk ? 'pass' : 'fail'} '
+        'test=${testOk ? 'pass' : 'fail'}.';
+    final green = analyzeOk && testOk && hasPassVerdict(verdict);
+    await gh.commentOnPr(
+      info.url,
+      '**AFK PR review (diff-verifier)**\n\n$suiteLine\n\n'
+      '${reviewComment(verdict)}$reviewSummary'
+      '\n\n_AFK review spend: \$${_prdCostUsd.toStringAsFixed(4)}._',
+    );
+    if (green) {
+      await gh.markPrReady(info.url);
+      events.event('PR_READY', prd: info.number);
+      print('  ${ansi.green('✓ Full suite + PR review PASS → marked ready.')}');
+    } else {
+      events.event(
+        'PR_DRAFT',
+        prd: info.number,
+        detail:
+            'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0} '
+            'review=${hasPassVerdict(verdict) ? 1 : 0}',
+      );
+      print(
+        ansi.red(
+          '  ✗ PR left as-is '
+          '(analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0} '
+          'review=${hasPassVerdict(verdict) ? 1 : 0}).',
+        ),
+      );
+    }
+    return green ? 0 : 1;
   }
 
   Future<int?> _selectActivePrd() async {
@@ -715,26 +818,27 @@ class HarnessLoop {
 
     _phase(HarnessPhase.pr, 'PRD #$activeParent');
     final title = await gh.issueTitle(activeParent);
-    final branch = await git.currentBranch();
+    final canonical = await git.currentBranch();
 
     // A large PRD is opened as a chain of stacked PRs (one small diff each);
     // a small one stays a single PR exactly as before. Both leave HEAD on the
-    // canonical branch so the holistic gate below sees the whole PRD diff.
+    // canonical branch so the holistic mechanical gate below sees the whole PRD.
     final chunks = await _chunkCommits();
-    final List<String> prUrls;
+    final List<_PrTarget> targets;
     if (chunks.length <= 1) {
-      final url = await _openOnePr(activeParent, title, branch);
+      final url = await _openOnePr(activeParent, title, canonical);
       if (url == null) return;
-      prUrls = [url];
+      targets = [
+        _PrTarget(url: url, baseRef: config.base, headBranch: canonical),
+      ];
     } else {
-      prUrls = await _openStackedPrs(activeParent, title, branch, chunks);
-      if (prUrls.isEmpty) return;
+      targets = await _openStackedPrs(activeParent, title, canonical, chunks);
+      if (targets.isEmpty) return;
     }
 
-    // PR gate: the whole suite + one holistic review over the full PRD diff,
-    // not the per-issue scoped subset. A red base (pre-existing failures) keeps
-    // every PR a draft for a human — work is never discarded here, only the
-    // auto-ready signal is withheld.
+    // Mechanical gate: the whole suite once over the canonical (full PRD) tree —
+    // a red base (pre-existing failures) keeps every PR a draft for a human;
+    // work is never discarded here, only the auto-ready signal is withheld.
     final analyzeOk = await _gate(HarnessPhase.analyze, [
       'flutter',
       'analyze',
@@ -744,64 +848,81 @@ class HarnessLoop {
       'test',
     ], _testLog);
     _logGates(activeParent, null, analyzeOk: analyzeOk, testOk: testOk);
-
-    _phase(HarnessPhase.review, 'PR #$activeParent');
-    final review = await _runWithApiRetry(
-      () => claude.verify(
-        prompts.prVerifier(
-          activeParent,
-          title,
-          config.base,
-          repo: config.repo,
-          prRef: prUrls.last,
-        ),
-      ),
-      'PR review #$activeParent',
-    );
-    _prdCostUsd += review.result?.costUsd ?? 0;
-    _abortIfFatal(review, 'PR review #$activeParent');
-    final verdict = review.transcript;
-    events.event(
-      'PR_REVIEW',
-      prd: activeParent,
-      detail: hasPassVerdict(verdict) ? 'pass' : 'fail',
-    );
-    final reviewSummary = review.result == null
-        ? ''
-        : '\n\n_Review: ${review.result!.summary}._';
     final suiteLine =
         'Full suite: analyze=${analyzeOk ? 'pass' : 'fail'} '
         'test=${testOk ? 'pass' : 'fail'}.';
-    final green = analyzeOk && testOk && hasPassVerdict(verdict);
-    for (final prUrl in prUrls) {
+
+    // Review each PR independently, scoped to its own diff: a single PR over the
+    // whole PRD, or each stacked chunk over just its slice. Per-PR review keeps
+    // a chunk PR carrying only the findings for the code it actually shows, and
+    // lets each chunk go ready on its own (chunk 1 can merge while chunk 2 fails).
+    final stacked = targets.length > 1;
+    for (var i = 0; i < targets.length; i++) {
+      final t = targets[i];
+      if (stacked) await git.checkout(t.headBranch);
+      _phase(
+        HarnessPhase.review,
+        stacked
+            ? 'PR #$activeParent [${i + 1}/${targets.length}]'
+            : 'PR #$activeParent',
+      );
+      final review = await _runWithApiRetry(
+        () => claude.verify(
+          prompts.prVerifier(
+            activeParent,
+            title,
+            t.baseRef,
+            repo: config.repo,
+            prRef: t.url,
+            chunkIndex: stacked ? i + 1 : null,
+            chunkTotal: stacked ? targets.length : null,
+          ),
+        ),
+        'PR review #$activeParent${stacked ? ' chunk ${i + 1}' : ''}',
+      );
+      _prdCostUsd += review.result?.costUsd ?? 0;
+      _abortIfFatal(review, 'PR review #$activeParent');
+      final pass = hasPassVerdict(review.transcript);
+      events.event(
+        'PR_REVIEW',
+        prd: activeParent,
+        detail: pass ? 'pass' : 'fail',
+      );
+      final reviewSummary = review.result == null
+          ? ''
+          : '\n\n_Review: ${review.result!.summary}._';
+      final green = analyzeOk && testOk && pass;
       await gh.commentOnPr(
-        prUrl,
+        t.url,
         '**AFK PR review (diff-verifier)**\n\n$suiteLine\n\n'
-        '$verdict$reviewSummary'
+        '${reviewComment(review.transcript)}$reviewSummary'
         '\n\n_Total AFK spend for PRD #$activeParent: '
         '\$${_prdCostUsd.toStringAsFixed(4)}._',
       );
-      if (green) await gh.markPrReady(prUrl);
+      if (green) {
+        await gh.markPrReady(t.url);
+        events.event('PR_READY', prd: activeParent, detail: 'url=${t.url}');
+        print(
+          '  ${ansi.green('✓ Full suite + review PASS → ${t.url} ready.')}',
+        );
+      } else {
+        events.event(
+          'PR_DRAFT',
+          prd: activeParent,
+          detail:
+              'url=${t.url} analyze=${analyzeOk ? 1 : 0} '
+              'test=${testOk ? 1 : 0} review=${pass ? 1 : 0}',
+        );
+        print(
+          ansi.red(
+            '  ✗ ${t.url} left as draft '
+            '(analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0} '
+            'review=${pass ? 1 : 0}).',
+          ),
+        );
+      }
     }
-    if (green) {
-      events.event('PR_READY', prd: activeParent);
-      print('  ${ansi.green('✓ Full suite + PR review PASS → marked ready.')}');
-    } else {
-      events.event(
-        'PR_DRAFT',
-        prd: activeParent,
-        detail:
-            'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0} '
-            'review=${hasPassVerdict(verdict) ? 1 : 0}',
-      );
-      print(
-        ansi.red(
-          '  ✗ PR left as draft for human '
-          '(analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0} '
-          'review=${hasPassVerdict(verdict) ? 1 : 0}).',
-        ),
-      );
-    }
+    if (stacked) await git.checkout(canonical);
   }
 
   /// Pushes [branch] and opens the single whole-PRD draft PR (the unsplit
@@ -866,9 +987,12 @@ class HarnessLoop {
   /// later chunk onto the previous chunk's branch, the last chunk reusing the
   /// canonical branch and carrying `Closes #parent`. Idempotent: a chunk whose
   /// branch already has an open PR is reused, so a re-run only fills the gaps.
-  /// Ends on the canonical branch for the holistic gate. Returns the PR urls in
-  /// stack order (empty if the first chunk could not be pushed).
-  Future<List<String>> _openStackedPrs(
+  /// Ends on the canonical branch for the holistic gate. Returns one
+  /// [_PrTarget] per chunk in stack order — carrying the chunk's diff base (the
+  /// previous chunk's branch, or `config.base` for the first) and head branch so
+  /// each PR can be reviewed over just its slice — or empty if the first chunk
+  /// could not be pushed.
+  Future<List<_PrTarget>> _openStackedPrs(
     int activeParent,
     String title,
     String canonical,
@@ -876,7 +1000,7 @@ class HarnessLoop {
   ) async {
     final slug = canonical.substring('$activeParent-'.length);
     final total = chunks.length;
-    final urls = <String>[];
+    final targets = <_PrTarget>[];
     var base = config.base;
     for (var i = 0; i < total; i++) {
       final isLast = i == total - 1;
@@ -887,7 +1011,9 @@ class HarnessLoop {
       final existing = await gh.openPrForBranch(branch);
       if (existing != null) {
         print('  PR ${i + 1}/$total exists: ${ansi.cyan(existing)}');
-        urls.add(existing);
+        targets.add(
+          _PrTarget(url: existing, baseRef: base, headBranch: branch),
+        );
         base = branch;
         continue;
       }
@@ -925,13 +1051,13 @@ class HarnessLoop {
         break;
       }
       events.event('PR_OPEN', prd: activeParent, detail: 'url=$prUrl');
-      urls.add(prUrl);
+      targets.add(_PrTarget(url: prUrl, baseRef: base, headBranch: branch));
       base = branch;
     }
     // Carving chunk branches moved HEAD; return to the canonical branch so the
-    // holistic gate + verifier run over the whole PRD diff.
+    // holistic mechanical gate runs over the whole PRD tree.
     await git.checkout(canonical);
-    return urls;
+    return targets;
   }
 
   String _failComment(
@@ -957,4 +1083,22 @@ class HarnessLoop {
     final start = lines.length > count ? lines.length - count : 0;
     return lines.sublist(start).join('\n');
   }
+}
+
+/// One opened PR to review: its [url], the branch its diff is taken against
+/// ([baseRef] → `origin/<baseRef>..HEAD`), and the [headBranch] to check out so
+/// that range resolves to just this PR's slice. For a single PR [baseRef] is
+/// `config.base` and [headBranch] the canonical branch; for a stacked chunk
+/// they are the previous chunk's branch (or `config.base` for the first) and
+/// the chunk branch.
+class _PrTarget {
+  _PrTarget({
+    required this.url,
+    required this.baseRef,
+    required this.headBranch,
+  });
+
+  final String url;
+  final String baseRef;
+  final String headBranch;
 }

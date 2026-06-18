@@ -3,7 +3,7 @@ You are reviewing the FULL pull request for PRD #{{PARENT_NUMBER}}: {{PARENT_TIT
 ## Target
 - PR: {{PR_REF}}
 - Repo: {{REPO}}
-- Diff: the commit range origin/{{BASE}}..HEAD, spanning every sub-issue of this PRD.
+- Diff: the commit range origin/{{BASE}}..HEAD.
 
 ## How to review
 Run your **Mode B** full-pull-request pipeline from your agent instructions, end
@@ -12,8 +12,7 @@ the under-80 filter, then the cited review comment. This is read-only — do NOT
 edit any file. Cite each surviving issue with a permalink under {{REPO}} built
 from the full `git rev-parse HEAD` SHA.
 
-Judge the PRD as a whole: the slices must fit together with no contradictions or
-integration gaps, and satisfy the PRD's intent. FAIL only for the blocking
+{{STACK_NOTE}} FAIL only for the blocking
 problems your instructions define; report surviving nits as non-blocking notes.
 
 ## Verdict

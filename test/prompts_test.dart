@@ -76,14 +76,25 @@ String _expectedPrVerifier(
   String base, {
   required String repo,
   required String prRef,
-}) =>
-    '''
+  int? chunkIndex,
+  int? chunkTotal,
+}) {
+  final stackNote = chunkIndex == null || chunkTotal == null
+      ? 'Judge the PRD as a whole: the slices must fit together with no '
+            'contradictions or integration gaps, and satisfy the PRD\'s intent.'
+      : 'This PR is chunk $chunkIndex/$chunkTotal of a stacked split of one '
+            'PRD; the range is ONLY this chunk\'s slice. Earlier chunks are '
+            'already in its base and later chunks build on top, so review just '
+            'this slice and do NOT flag incompleteness that a later chunk '
+            'resolves (a symbol defined here and used later, a feature '
+            'finished in a later chunk).';
+  return '''
 You are reviewing the FULL pull request for PRD #$parent: $title.
 
 ## Target
 - PR: $prRef
 - Repo: $repo
-- Diff: the commit range origin/$base..HEAD, spanning every sub-issue of this PRD.
+- Diff: the commit range origin/$base..HEAD.
 
 ## How to review
 Run your **Mode B** full-pull-request pipeline from your agent instructions, end
@@ -92,12 +103,12 @@ the under-80 filter, then the cited review comment. This is read-only — do NOT
 edit any file. Cite each surviving issue with a permalink under $repo built
 from the full `git rev-parse HEAD` SHA.
 
-Judge the PRD as a whole: the slices must fit together with no contradictions or
-integration gaps, and satisfy the PRD's intent. FAIL only for the blocking
+$stackNote FAIL only for the blocking
 problems your instructions define; report surviving nits as non-blocking notes.
 
 ## Verdict
 End your response with exactly one line and nothing after it: either `VERDICT: PASS` or `VERDICT: FAIL`.''';
+}
 
 Issue _issue({
   int number = 5,
@@ -262,5 +273,37 @@ void main() {
         ).trim(),
       );
     });
+
+    test(
+      'pr-verifier — a stacked chunk scopes the note to its slice',
+      () async {
+        final lib = await defaults();
+        final out = lib.prVerifier(
+          42,
+          'My PRD',
+          '42-chunk-1-of-3-my-prd',
+          repo: 'octo/app',
+          prRef: 'https://github.com/octo/app/pull/8',
+          chunkIndex: 2,
+          chunkTotal: 3,
+        );
+        expect(
+          out.trim(),
+          _expectedPrVerifier(
+            42,
+            'My PRD',
+            '42-chunk-1-of-3-my-prd',
+            repo: 'octo/app',
+            prRef: 'https://github.com/octo/app/pull/8',
+            chunkIndex: 2,
+            chunkTotal: 3,
+          ).trim(),
+        );
+        // The chunk note replaces the whole-PRD framing and names the slice.
+        expect(out, contains('chunk 2/3 of a stacked split'));
+        expect(out, isNot(contains('Judge the PRD as a whole')));
+        expect(out, contains('origin/42-chunk-1-of-3-my-prd..HEAD'));
+      },
+    );
   });
 }

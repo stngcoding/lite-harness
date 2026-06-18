@@ -389,8 +389,8 @@ void main() {
       expect(gh.prBody['263-prd'], contains('Closes #263'));
       expect(gh.prBody['263-chunk-1-of-3-prd'], isNot(contains('Closes')));
       expect(gh.prBody['263-chunk-2-of-3-prd'], isNot(contains('Closes')));
-      // One holistic review; every PR in the stack is marked ready.
-      expect(claude.verifyCount, 1);
+      // Each chunk PR is reviewed over its own slice; every PR is marked ready.
+      expect(claude.verifyCount, 3);
       expect(
         gh.readyMarked,
         containsAll(<String>[

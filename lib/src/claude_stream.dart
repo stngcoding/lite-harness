@@ -280,10 +280,10 @@ class StreamRenderer {
           _transcript.writeln(text);
           if (text.trim().isNotEmpty) _sink.writeln(text);
         case AssistantThinkingEvent(:final text):
-          if (text.trim().isNotEmpty) _sink.writeln(_ansi.dim('💭 $text'));
+          if (text.trim().isNotEmpty) _sink.writeln(_ansi.dimCyan('💭 $text'));
         case ToolUseEvent(:final name, :final summary):
           final label = summary.isEmpty ? name : '$name — $summary';
-          _sink.writeln(_ansi.dim('  ⚒ $label'));
+          _sink.writeln(_ansi.dimMagenta('  ⚒ $label'));
         case ResultEvent():
           _result = event;
           final tone = event.isError ? _ansi.red : _ansi.dim;
