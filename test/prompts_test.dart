@@ -245,6 +245,33 @@ void main() {
       expect(out, contains('- #10 Sibling slice'));
     });
 
+    test(
+      'implementer — sibling history points the agent at git log in a PRD',
+      () async {
+        final lib = await defaults();
+        final out = lib.implementer(
+          issue: _issue(number: 11),
+          comments: '',
+          prdContext: '## PRD #9: Parent',
+          base: 'dev',
+        );
+        expect(
+          out,
+          contains('### Sibling slices already landed on this branch'),
+        );
+        expect(out, contains('git log --oneline origin/dev..HEAD'));
+      },
+    );
+
+    test(
+      'implementer — no sibling history for a standalone PRD-of-one',
+      () async {
+        final lib = await defaults();
+        final out = lib.implementer(issue: _issue(), comments: '', base: 'dev');
+        expect(out, isNot(contains('Sibling slices already landed')));
+      },
+    );
+
     test('verifier — both gates, populated body', () async {
       final lib = await defaults();
       final issue = _issue();

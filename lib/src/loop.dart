@@ -696,6 +696,7 @@ class HarnessLoop {
             comments: comments,
             prdContext: coherence.prdContext,
             sliceMap: coherence.sliceMap,
+            base: config.base,
             retry: retry,
             lane: lane,
           ),

@@ -68,6 +68,7 @@ class PromptLibrary {
   static const _implementerVars = {
     'PRD_CONTEXT',
     'SLICE_MAP',
+    'SIBLING_HISTORY',
     'ISSUE_NUMBER',
     'ISSUE_TITLE',
     'LABELS',
@@ -147,6 +148,7 @@ class PromptLibrary {
     required String comments,
     String prdContext = '',
     String sliceMap = '',
+    String base = '',
     String retry = '',
     RiskLane? lane,
   }) {
@@ -157,6 +159,7 @@ class PromptLibrary {
           ? ''
           : '\n### Sibling slices in this PRD (coordinate shared interfaces)\n'
                 '$sliceMap\n',
+      'SIBLING_HISTORY': prdContext.isEmpty ? '' : _siblingHistory(base),
       'ISSUE_NUMBER': '${issue.number}',
       'ISSUE_TITLE': issue.title,
       'LABELS': labels.isEmpty ? '' : 'Labels: $labels\n',
@@ -191,6 +194,18 @@ class PromptLibrary {
           '</risk>\n',
     RiskLane.tiny || RiskLane.normal || null => '',
   };
+
+  /// Points the implementer at the sibling slices already committed on this PRD
+  /// branch, so it reads what they actually built instead of guessing their
+  /// interfaces. Rendered only when there is a PRD (parent), so a standalone
+  /// PRD-of-one — which never has siblings — sees nothing. Backward-looking,
+  /// the counterpart to the forward-looking SLICE_MAP (still-open siblings).
+  static String _siblingHistory(String base) =>
+      '\n### Sibling slices already landed on this branch\n'
+      'Earlier slices of this PRD are already committed here. Before defining '
+      'any shared interface, skim `git log --oneline origin/$base..HEAD` (each '
+      'commit is `feat(#N): <title>`) and `git show <sha>` only the slice(s) '
+      'whose interface yours consumes. Read what they built — do not guess.\n';
 
   String verifier(
     Issue issue,
