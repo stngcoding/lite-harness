@@ -12,8 +12,8 @@ the under-80 filter, then the cited review comment. This is read-only — do NOT
 edit any file. Cite each surviving issue with a permalink under {{REPO}} built
 from the full `git rev-parse HEAD` SHA.
 
-{{STACK_NOTE}} FAIL only for the blocking
-problems your instructions define; report surviving nits as non-blocking notes.
+Judge the PRD as a whole: the slices must fit together with no contradictions or integration gaps, and satisfy the PRD's intent. FAIL only for the blocking
+problems your instructions define; report surviving nits as non-blocking notes.{{RISK}}
 
 ## Verdict
 End your response with exactly one line and nothing after it: either `VERDICT: PASS` or `VERDICT: FAIL`.

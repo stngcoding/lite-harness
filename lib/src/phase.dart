@@ -9,6 +9,7 @@ import 'ansi.dart';
 enum HarnessPhase {
   select('SELECT'),
   checkout('CHECKOUT'),
+  classify('CLASSIFY'),
   implement('IMPLEMENT'),
   commit('COMMIT'),
   analyze('ANALYZE'),
@@ -22,6 +23,7 @@ enum HarnessPhase {
 
   String _color(Ansi ansi) => switch (this) {
     HarnessPhase.select || HarnessPhase.checkout => ansi.cyan(label),
+    HarnessPhase.classify => ansi.cyan(label),
     HarnessPhase.implement => ansi.blue(label),
     HarnessPhase.commit => ansi.magenta(label),
     HarnessPhase.analyze || HarnessPhase.test => ansi.yellow(label),

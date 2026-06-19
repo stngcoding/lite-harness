@@ -43,13 +43,6 @@ ArgParser _buildParser() => ArgParser()
         'a human (default: 3, env MAX_ATTEMPTS).',
   )
   ..addOption(
-    'split-threshold',
-    help:
-        'Split a PRD into stacked PRs when its diff exceeds N changed lines '
-        '(insertions + deletions), cut at sub-issue commit boundaries '
-        '(default: 800, env SPLIT_THRESHOLD).',
-  )
-  ..addOption(
     'review-pr',
     help:
         'Skip the implement loop and only review this PR (number or URL): full '
@@ -146,20 +139,6 @@ Future<void> _run(List<String> arguments, String debugLogPath) async {
     maxAttempts = parsed;
   }
 
-  final splitThresholdArg =
-      options['split-threshold'] as String? ?? env['SPLIT_THRESHOLD'];
-  var splitThreshold = 800;
-  if (splitThresholdArg != null) {
-    final parsed = int.tryParse(splitThresholdArg);
-    if (parsed == null || parsed < 1) {
-      stderr.writeln(
-        '--split-threshold expects a positive integer, got '
-        '"$splitThresholdArg".',
-      );
-      exit(64);
-    }
-    splitThreshold = parsed;
-  }
   final ansi = Ansi.forStdout();
   final proc = ProcessRunner();
   final repo =
@@ -181,7 +160,6 @@ Future<void> _run(List<String> arguments, String debugLogPath) async {
     iterations: iterations,
     issueNumber: issueNumber,
     maxAttempts: maxAttempts,
-    splitThreshold: splitThreshold,
     reviewPr: options['review-pr'] as String?,
   );
 

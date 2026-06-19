@@ -1,5 +1,13 @@
+import 'dart:io';
+
 import 'package:dartralph/dartralph.dart';
 import 'package:test/test.dart';
+
+/// A trace store pointed at a throwaway temp file so loop tests never write
+/// into the repo's `.dartralph/`.
+TraceStore _tempTraces() => TraceStore(
+  '${Directory.systemTemp.createTempSync('lh-trace').path}/t.jsonl',
+);
 
 const _okResult = ResultEvent(
   subtype: 'success',
@@ -168,6 +176,10 @@ class FakeClaude extends ClaudeRunner {
   @override
   Future<ClaudeRun> verify(String prompt) async =>
       const ClaudeRun(transcript: 'VERDICT: PASS', result: _okResult);
+
+  @override
+  Future<ClaudeRun> classify(String prompt) async =>
+      const ClaudeRun(transcript: 'LANE: normal', result: _okResult);
 }
 
 class FakeProc extends ProcessRunner {
@@ -182,6 +194,7 @@ PromptLibrary _prompts() => PromptLibrary(
   }),
   verifier: PromptTemplate('verifier', 'v', const {}),
   prVerifier: PromptTemplate('pr-verifier', 'p', const {}),
+  intake: PromptTemplate('intake', 'i', const {}),
 );
 
 const _config = Config(
@@ -199,6 +212,7 @@ HarnessLoop _loop(StaleGh gh, FakeClaude claude, FakeGit git) => HarnessLoop(
   claude: claude,
   proc: FakeProc(),
   prompts: _prompts(),
+  traces: _tempTraces(),
 );
 
 void main() {

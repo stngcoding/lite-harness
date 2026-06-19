@@ -26,3 +26,35 @@ String reviewComment(String transcript) {
   final i = transcript.lastIndexOf('### Code review');
   return i == -1 ? transcript.trim() : transcript.substring(i).trim();
 }
+
+/// How risky a slice is, set by the intake agent and used to scale the gate:
+/// it tunes the implementer's guidance and the PR reviewer's bar, but never
+/// blocks the AFK loop. Ordered least → most risky so a PRD can take the max
+/// of its slices' lanes.
+enum RiskLane {
+  tiny('tiny'),
+  normal('normal'),
+  highRisk('high-risk');
+
+  const RiskLane(this.label);
+
+  /// The protocol token the intake agent emits and the parser reads.
+  final String label;
+}
+
+/// Reads the intake agent's risk lane from a transcript.
+///
+/// Mirrors [hasPassVerdict]: only a line that is exactly `LANE: <label>` counts
+/// and the last such line wins, so prose that merely mentions the format cannot
+/// flip the lane. Returns null when no lane line is present — the caller then
+/// defaults to a safe lane rather than treating absence as a failure.
+RiskLane? parseLane(String transcript) {
+  RiskLane? last;
+  for (final line in transcript.split('\n')) {
+    final trimmed = line.trim();
+    for (final lane in RiskLane.values) {
+      if (trimmed == 'LANE: ${lane.label}') last = lane;
+    }
+  }
+  return last;
+}

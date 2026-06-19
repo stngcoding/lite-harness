@@ -137,6 +137,27 @@ void main() {
       expect(event.isLimited, isFalse);
     });
 
+    test('emits a UsageEvent summing input and both cache figures', () {
+      final events = parseStreamJsonLine(
+        '{"type":"assistant","message":{"content":'
+        '[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,'
+        '"cache_read_input_tokens":1000,"cache_creation_input_tokens":200,'
+        '"output_tokens":50}}}',
+      );
+      expect(events, hasLength(2));
+      expect((events[0] as AssistantTextEvent).text, 'hi');
+      // Context occupancy = input + cache read + cache creation (not output).
+      expect((events[1] as UsageEvent).contextTokens, 1210);
+    });
+
+    test('a message with no usage emits no UsageEvent', () {
+      final events = parseStreamJsonLine(
+        '{"type":"assistant","message":{"content":'
+        '[{"type":"text","text":"hi"}]}}',
+      );
+      expect(events.whereType<UsageEvent>(), isEmpty);
+    });
+
     test('parses a system api_retry event', () {
       final event =
           parseStreamJsonLine(
@@ -230,5 +251,47 @@ void main() {
         expect(renderer.transcript, isEmpty);
       },
     );
+
+    test('tracks peak usage and renders context headroom on the result', () {
+      final sink = _CapturingSink();
+      final renderer = StreamRenderer(
+        sink: sink,
+        ansi: const Ansi(enabled: false),
+        contextWindow: 200000,
+      );
+      // Two turns; the peak (150k of 200k → 25% free) wins over the earlier one.
+      renderer.onLine(
+        '{"type":"assistant","message":{"content":[],'
+        '"usage":{"input_tokens":50000}}}',
+      );
+      renderer.onLine(
+        '{"type":"assistant","message":{"content":[],'
+        '"usage":{"input_tokens":150000}}}',
+      );
+      renderer.onLine(
+        '{"type":"result","subtype":"success","is_error":false,'
+        '"duration_ms":1000,"num_turns":2,"total_cost_usd":0.01,'
+        '"permission_denials":[]}',
+      );
+
+      expect(renderer.peakContextTokens, 150000);
+      expect(sink.buffer.toString(), contains('ctx 25% free'));
+    });
+
+    test('omits the context suffix when no usage was reported', () {
+      final sink = _CapturingSink();
+      final renderer = StreamRenderer(
+        sink: sink,
+        ansi: const Ansi(enabled: false),
+      );
+      renderer.onLine(
+        '{"type":"result","subtype":"success","is_error":false,'
+        '"duration_ms":1000,"num_turns":1,"total_cost_usd":0.01,'
+        '"permission_denials":[]}',
+      );
+
+      expect(renderer.peakContextTokens, 0);
+      expect(sink.buffer.toString(), isNot(contains('ctx')));
+    });
   });
 }

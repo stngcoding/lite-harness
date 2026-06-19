@@ -13,4 +13,5 @@ export 'src/proc.dart';
 export 'src/prompts.dart';
 export 'src/rules.dart';
 export 'src/test_scope.dart';
+export 'src/trace.dart';
 export 'src/verdict.dart';

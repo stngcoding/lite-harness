@@ -283,15 +283,47 @@ class GhCli {
   Future<void> markPrReady(String ref) =>
       _quiet(['pr', 'ready', ref, '--repo', repo]);
 
-  Future<void> editPr(String ref, {String? base, String? title}) => _quiet([
-    'pr',
-    'edit',
-    ref,
-    '--repo',
-    repo,
-    if (base != null) ...['--base', base],
-    if (title != null) ...['--title', title],
-  ]);
+  /// Demotes a ready PR back to draft (`gh pr ready --undo`). Used to pull a
+  /// previously-green PR out of review when a later re-run regresses it.
+  Future<void> markPrDraft(String ref) =>
+      _quiet(['pr', 'ready', ref, '--repo', repo, '--undo']);
+
+  /// Closes any open PR whose head is a leftover stacked-PR chunk branch for
+  /// [parent] (`<parent>-chunk-…`). The harness no longer splits PRDs, so these
+  /// orphans from an older split run must not linger beside the single PR.
+  Future<void> closeChunkPrs(int parent) async {
+    final result = await _proc.run('gh', [
+      'pr',
+      'list',
+      '--repo',
+      repo,
+      '--state',
+      'open',
+      '--json',
+      'number,headRefName',
+    ]);
+    if (!result.ok) return;
+    final List<dynamic> list;
+    try {
+      list = jsonDecode(result.stdout) as List;
+    } on FormatException {
+      return;
+    }
+    final prefix = '$parent-chunk-';
+    for (final json in list.cast<Map<String, dynamic>>()) {
+      final head = json['headRefName'] as String? ?? '';
+      if (!head.startsWith(prefix)) continue;
+      await _quiet([
+        'pr',
+        'close',
+        '${json['number']}',
+        '--repo',
+        repo,
+        '--comment',
+        'Superseded: this PRD now ships as a single PR.',
+      ]);
+    }
+  }
 
   Future<void> _quiet(List<String> arguments) async {
     await _proc.run('gh', arguments);

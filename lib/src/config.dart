@@ -8,7 +8,7 @@ class Config {
     this.iterations,
     this.issueNumber,
     this.maxAttempts = 3,
-    this.splitThreshold = 800,
+    this.maxReviewFixes = 3,
     this.reviewPr,
   });
 
@@ -27,10 +27,10 @@ class Config {
   /// test logs back to the implementer so it can fix forward.
   final int maxAttempts;
 
-  /// When a PRD's diff exceeds this many changed lines (insertions + deletions),
-  /// it is opened as a chain of stacked PRs instead of one — cut at sub-issue
-  /// commit boundaries so each PR stays small enough to review comfortably.
-  final int splitThreshold;
+  /// When a PRD's gates are green but the holistic review FAILS, the harness
+  /// feeds the blocking findings back to a PRD-level fix agent and re-reviews,
+  /// up to this many rounds before leaving the PR a draft for a human.
+  final int maxReviewFixes;
 
   /// When set, the harness skips the whole implement loop and only reviews this
   /// PR (number or URL): check out its head, run the full suite + diff-verifier

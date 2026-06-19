@@ -58,10 +58,18 @@ int parentOf(String body, int ownNumber) {
   return number == null ? ownNumber : int.parse(number);
 }
 
-List<int> blockersOf(String body) => RegExp(r'#(\d+)')
-    .allMatches(_section(body, 'Blocked by'))
-    .map((m) => int.parse(m.group(1)!))
-    .toList();
+List<int> blockersOf(String body) {
+  final section = _section(body, 'Blocked by');
+  // Convention: a "None" section means no blockers. Authors often add a prose
+  // explanation after it ("None — can start on the PR #338 branch") that itself
+  // mentions other issue/PR numbers; without this guard the `#N` regex would
+  // pick those incidental references up as phantom blockers and the issue would
+  // never be picked up while they stay open.
+  if (RegExp(r'^\s*none\b', caseSensitive: false).hasMatch(section)) return [];
+  return RegExp(
+    r'#(\d+)',
+  ).allMatches(section).map((m) => int.parse(m.group(1)!)).toList();
+}
 
 /// Numbers of issues in [issues] that are the `## Parent` of at least one
 /// other issue — the umbrella PRDs. An umbrella only groups its slices and is

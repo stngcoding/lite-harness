@@ -1,5 +1,13 @@
+import 'dart:io';
+
 import 'package:dartralph/dartralph.dart';
 import 'package:test/test.dart';
+
+/// A trace store pointed at a throwaway temp file so loop tests never write
+/// into the repo's `.dartralph/`.
+TraceStore _tempTraces() => TraceStore(
+  '${Directory.systemTemp.createTempSync('lh-trace').path}/t.jsonl',
+);
 
 const _okResult = ResultEvent(
   subtype: 'success',
@@ -108,6 +116,10 @@ class FlakyClaude extends ClaudeRunner {
   @override
   Future<ClaudeRun> verify(String prompt) async =>
       const ClaudeRun(transcript: 'VERDICT: PASS', result: _okResult);
+
+  @override
+  Future<ClaudeRun> classify(String prompt) async =>
+      const ClaudeRun(transcript: 'LANE: normal', result: _okResult);
 }
 
 PromptLibrary _prompts() => PromptLibrary(
@@ -118,6 +130,7 @@ PromptLibrary _prompts() => PromptLibrary(
   ),
   verifier: PromptTemplate('verifier', 'v', const {}),
   prVerifier: PromptTemplate('pr-verifier', 'p', const {}),
+  intake: PromptTemplate('intake', 'i', const {}),
 );
 
 Config _config() => const Config(
@@ -136,6 +149,7 @@ HarnessLoop _loop(FakeGh gh, FlakyClaude claude, FakeGit git) => HarnessLoop(
   claude: claude,
   proc: ProcessRunner(),
   prompts: _prompts(),
+  traces: _tempTraces(),
   // Don't actually sleep between retries; keep the 3-retry cap.
   apiRetryBackoff: const [Duration.zero, Duration.zero, Duration.zero],
 );

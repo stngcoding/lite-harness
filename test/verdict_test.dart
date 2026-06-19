@@ -36,6 +36,33 @@ void main() {
     });
   });
 
+  group('parseLane', () {
+    test('matches a bare LANE line for each lane', () {
+      expect(parseLane('FLAGS: auth\nLANE: high-risk'), RiskLane.highRisk);
+      expect(parseLane('reasoning...\nLANE: normal\n'), RiskLane.normal);
+      expect(parseLane('  LANE: tiny  '), RiskLane.tiny);
+    });
+
+    test('returns null when no lane line is present', () {
+      expect(parseLane('this is a tiny change, low risk'), isNull);
+      expect(parseLane(''), isNull);
+    });
+
+    test('the last lane line wins', () {
+      expect(
+        parseLane('LANE: tiny\non reflection\nLANE: high-risk'),
+        RiskLane.highRisk,
+      );
+    });
+
+    test('ignores lane mentions embedded in prose lines', () {
+      expect(
+        parseLane('I will end with LANE: tiny or LANE: high-risk.'),
+        isNull,
+      );
+    });
+  });
+
   group('reviewComment', () {
     test('keeps only the block under the last review heading', () {
       const transcript =

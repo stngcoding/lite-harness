@@ -30,6 +30,17 @@ class ToolUseEvent extends StreamEvent {
   final String summary;
 }
 
+/// The per-turn token usage carried on an `assistant` message. [contextTokens]
+/// is how much of the model's context window that turn's request filled —
+/// `input_tokens` plus both cache figures (a cache *read* still occupies the
+/// window). The peak across a run is the high-water mark of context pressure on
+/// the agent: a big injected prompt and a long tool loop both push it up.
+class UsageEvent extends StreamEvent {
+  const UsageEvent(this.contextTokens);
+
+  final int contextTokens;
+}
+
 /// The terminal `result` event a headless `claude -p` run emits once, carrying
 /// the run's telemetry. None of this is in the transcript the verdict reads —
 /// it is surfaced separately for AFK monitoring (cost, turns, failure mode).
@@ -175,10 +186,10 @@ List<StreamEvent> parseStreamJsonLine(String line) {
   }
   if (decoded case {
     'type': 'assistant',
-    'message': {'content': final List content},
-  }) {
-    return [
-      for (final block in content)
+    'message': final Map message,
+  } when message['content'] is List) {
+    final events = <StreamEvent>[
+      for (final block in (message['content'] as List))
         ...switch (block) {
           {'type': 'text', 'text': final String text} => [
             AssistantTextEvent(text),
@@ -192,6 +203,11 @@ List<StreamEvent> parseStreamJsonLine(String line) {
           _ => const <StreamEvent>[],
         },
     ];
+    if (message['usage'] case final Map usage) {
+      final ctx = _contextTokens(usage);
+      if (ctx > 0) events.add(UsageEvent(ctx));
+    }
+    return events;
   }
   if (decoded case {'type': 'result', 'subtype': final String subtype}) {
     final map = decoded as Map;
@@ -235,6 +251,16 @@ List<StreamEvent> parseStreamJsonLine(String line) {
   return const [];
 }
 
+/// The context-window occupancy of a turn from its `usage` map: fresh input
+/// plus both cache figures. A cache *read* does not bill full price but still
+/// fills the window, so it counts toward the headroom calculation.
+int _contextTokens(Map usage) {
+  int n(Object? v) => (v as num?)?.toInt() ?? 0;
+  return n(usage['input_tokens']) +
+      n(usage['cache_read_input_tokens']) +
+      n(usage['cache_creation_input_tokens']);
+}
+
 String _summarizeInput(Object? input) {
   if (input is! Map || input.isEmpty) return '';
   final key = _summaryKeys.firstWhere(
@@ -249,16 +275,27 @@ String _truncate(String text, int max) =>
     text.length <= max ? text : '${text.substring(0, max - 1)}…';
 
 class StreamRenderer {
-  StreamRenderer({IOSink? sink, Ansi? ansi})
+  StreamRenderer({IOSink? sink, Ansi? ansi, this.contextWindow = 200000})
     : _sink = sink ?? stdout,
       _ansi = ansi ?? Ansi.forStdout();
 
   final IOSink _sink;
   final Ansi _ansi;
 
+  /// The model's context window in tokens, used to render peak usage as a
+  /// "% free" headroom figure on the terminal `result` line.
+  final int contextWindow;
+
   final StringBuffer _transcript = StringBuffer();
 
   String get transcript => _transcript.toString();
+
+  int _peakContextTokens = 0;
+
+  /// The highest context-window occupancy seen across the run (0 if no `usage`
+  /// was reported). Lets the caller record how close the agent ran to its
+  /// context limit.
+  int get peakContextTokens => _peakContextTokens;
 
   ResultEvent? _result;
 
@@ -284,10 +321,14 @@ class StreamRenderer {
         case ToolUseEvent(:final name, :final summary):
           final label = summary.isEmpty ? name : '$name — $summary';
           _sink.writeln(_ansi.dimMagenta('  ⚒ $label'));
+        case UsageEvent(:final contextTokens):
+          if (contextTokens > _peakContextTokens) {
+            _peakContextTokens = contextTokens;
+          }
         case ResultEvent():
           _result = event;
           final tone = event.isError ? _ansi.red : _ansi.dim;
-          _sink.writeln(tone('  └ ${event.summary}'));
+          _sink.writeln(tone('  └ ${event.summary}${_contextSuffix()}'));
         case ApiRetryEvent():
           _sink.writeln(_ansi.yellow('  ↻ ${event.summary}'));
         case RateLimitEvent():
@@ -297,5 +338,14 @@ class StreamRenderer {
           }
       }
     }
+  }
+
+  /// ` · ctx N% free` from the peak occupancy, or empty when no usage was seen.
+  String _contextSuffix() {
+    if (_peakContextTokens == 0) return '';
+    final free = ((contextWindow - _peakContextTokens) / contextWindow * 100)
+        .clamp(0, 100)
+        .round();
+    return ' · ctx $free% free';
   }
 }

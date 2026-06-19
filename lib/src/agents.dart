@@ -27,6 +27,7 @@ class AgentInstaller {
     'diff-verifier',
     'pr-review-lens',
     'pr-review-haiku',
+    'intake',
   ];
 
   /// Where an agent lives inside a target repo, relative to its root.

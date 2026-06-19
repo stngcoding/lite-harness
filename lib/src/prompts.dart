@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'issue.dart';
+import 'verdict.dart';
 
 /// Thrown when a prompt template references a placeholder the harness does not
 /// supply. Raised at load time so a typo never reaches a live `claude` run.
@@ -50,13 +51,16 @@ class PromptLibrary {
     required PromptTemplate implementer,
     required PromptTemplate verifier,
     required PromptTemplate prVerifier,
+    required PromptTemplate intake,
   }) : _implementer = implementer,
        _verifier = verifier,
-       _prVerifier = prVerifier;
+       _prVerifier = prVerifier,
+       _intake = intake;
 
   final PromptTemplate _implementer;
   final PromptTemplate _verifier;
   final PromptTemplate _prVerifier;
+  final PromptTemplate _intake;
 
   static const _implementerVars = {
     'PRD_CONTEXT',
@@ -67,6 +71,7 @@ class PromptLibrary {
     'ISSUE_BODY',
     'COMMENTS',
     'RETRY',
+    'RISK',
   };
   static const _verifierVars = {
     'ISSUE_NUMBER',
@@ -82,7 +87,14 @@ class PromptLibrary {
     'BASE',
     'REPO',
     'PR_REF',
-    'STACK_NOTE',
+    'RISK',
+  };
+  static const _intakeVars = {
+    'PRD_CONTEXT',
+    'ISSUE_NUMBER',
+    'ISSUE_TITLE',
+    'LABELS',
+    'ISSUE_BODY',
   };
 
   static Future<PromptLibrary> load({Directory? repoRoot}) async {
@@ -91,6 +103,7 @@ class PromptLibrary {
       implementer: await _resolve('implementer', root, _implementerVars),
       verifier: await _resolve('verifier', root, _verifierVars),
       prVerifier: await _resolve('pr-verifier', root, _prVerifierVars),
+      intake: await _resolve('intake', root, _intakeVars),
     );
   }
 
@@ -125,6 +138,7 @@ class PromptLibrary {
     String prdContext = '',
     String sliceMap = '',
     String retry = '',
+    RiskLane? lane,
   }) {
     final labels = issue.labels.join(', ');
     return _implementer.render({
@@ -141,8 +155,32 @@ class PromptLibrary {
           : issue.body,
       'COMMENTS': comments.isEmpty ? '' : '\n### Comments\n$comments\n',
       'RETRY': retry,
+      'RISK': _implementerRisk(lane),
     });
   }
+
+  /// The risk-lane block injected into the implementer prompt. Only a high-risk
+  /// lane raises the bar (the prompt body is already written for the normal
+  /// case); tiny and an unclassified (null) lane add nothing, so the placeholder
+  /// renders empty and the prompt is byte-for-byte the baseline.
+  static String _implementerRisk(RiskLane? lane) => switch (lane) {
+    RiskLane.highRisk =>
+      '\n<risk lane="high-risk">\n'
+          'HIGH-RISK slice (auth, data model / migration, a public contract, '
+          'security, an external provider, or existing behavior). Before you '
+          'change anything:\n'
+          '- Preserve existing public contracts and persisted data shapes: do '
+          'NOT rename or repurpose a shared field, route parameter, or '
+          'provider/cubit scope a sibling slice or caller depends on.\n'
+          '- Keep any interface a sibling slice will consume carrying the '
+          'parameters that slice needs.\n'
+          '- State every assumption you make explicitly where it is not '
+          'obvious.\n'
+          '- Add tests that prove the changed behavior, including the edge the '
+          'risk points at.\n'
+          '</risk>\n',
+    RiskLane.tiny || RiskLane.normal || null => '',
+  };
 
   String verifier(
     Issue issue,
@@ -164,25 +202,39 @@ class PromptLibrary {
     String base, {
     required String repo,
     required String prRef,
-    int? chunkIndex,
-    int? chunkTotal,
+    RiskLane? lane,
   }) {
-    final stackNote = chunkIndex == null || chunkTotal == null
-        ? 'Judge the PRD as a whole: the slices must fit together with no '
-              'contradictions or integration gaps, and satisfy the PRD\'s intent.'
-        : 'This PR is chunk $chunkIndex/$chunkTotal of a stacked split of one '
-              'PRD; the range is ONLY this chunk\'s slice. Earlier chunks are '
-              'already in its base and later chunks build on top, so review just '
-              'this slice and do NOT flag incompleteness that a later chunk '
-              'resolves (a symbol defined here and used later, a feature '
-              'finished in a later chunk).';
     return _prVerifier.render({
       'PARENT_NUMBER': '$parent',
       'PARENT_TITLE': title,
       'BASE': base,
       'REPO': repo,
       'PR_REF': prRef,
-      'STACK_NOTE': stackNote,
+      'RISK': _prVerifierRisk(lane),
+    });
+  }
+
+  /// The risk-lane note injected into the PR reviewer prompt. Only a high-risk
+  /// PRD tightens the bar; otherwise the placeholder renders empty so the prompt
+  /// is the baseline. Advisory — it steers the reviewer, never blocks the loop.
+  static String _prVerifierRisk(RiskLane? lane) => lane != RiskLane.highRisk
+      ? ''
+      : '\n\nThis PRD is HIGH-RISK (auth, data model / migration, a public '
+            'contract, security, or an external provider). Tighten your bar: '
+            'verify every contract, auth, and migration claim against the '
+            'actual diff, and do NOT PASS on an unverified contract claim — '
+            'treat an unproven behavior change as a blocking gap, not a note.';
+
+  String intake({required Issue issue, String prdContext = ''}) {
+    final labels = issue.labels.join(', ');
+    return _intake.render({
+      'PRD_CONTEXT': prdContext.isEmpty ? '' : '$prdContext\n\n',
+      'ISSUE_NUMBER': '${issue.number}',
+      'ISSUE_TITLE': issue.title,
+      'LABELS': labels.isEmpty ? '' : 'Labels: $labels\n',
+      'ISSUE_BODY': issue.body.isEmpty
+          ? '(no description provided)'
+          : issue.body,
     });
   }
 }

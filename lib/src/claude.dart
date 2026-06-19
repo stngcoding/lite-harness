@@ -6,11 +6,32 @@ import 'proc.dart';
 /// plus the terminal [result] telemetry (cost/turns/outcome) for AFK monitoring.
 /// [result] is null when the process died before emitting a `result` event.
 class ClaudeRun {
-  const ClaudeRun({required this.transcript, this.result, this.rateLimited});
+  const ClaudeRun({
+    required this.transcript,
+    this.result,
+    this.rateLimited,
+    this.peakContextTokens = 0,
+    this.contextWindow = 200000,
+  });
 
   final String transcript;
   final ResultEvent? result;
   final RateLimitEvent? rateLimited;
+
+  /// The run's peak context-window occupancy in tokens (0 if none was
+  /// reported), and the window it is measured against.
+  final int peakContextTokens;
+  final int contextWindow;
+
+  /// How much context headroom the agent had left at its peak, as a percentage
+  /// of the window — null when no usage was reported (e.g. the process died
+  /// before any `assistant` message). A low value means it ran close to the
+  /// limit and was at risk of truncating its own working memory.
+  double? get contextFreePct => peakContextTokens == 0
+      ? null
+      : ((contextWindow - peakContextTokens) / contextWindow * 100)
+            .clamp(0, 100)
+            .toDouble();
 
   /// A *transient* API failure the loop can recover from by retrying the same
   /// `claude` run after a backoff — an overloaded/5xx status, a dropped stream
@@ -53,6 +74,14 @@ class ClaudeAbort implements Exception {
   String toString() => 'ClaudeAbort: $message';
 }
 
+/// The context window in tokens for [model], used to turn raw usage into a
+/// "% free" headroom figure. Every Claude model the harness currently targets
+/// (opus/sonnet/haiku) exposes a 200k window; the map is the seam for a model
+/// whose window differs from the default.
+int contextWindowFor(String model) => _contextWindows[model] ?? 200000;
+
+const _contextWindows = <String, int>{};
+
 class ClaudeRunner {
   ClaudeRunner(this._proc, {Ansi? ansi}) : _ansi = ansi ?? Ansi.forStdout();
 
@@ -73,7 +102,7 @@ class ClaudeRunner {
     '--verbose',
     '-p',
     prompt,
-  ]);
+  ], contextWindow: contextWindowFor(model));
 
   Future<ClaudeRun> verify(String prompt) => _run([
     '--agent',
@@ -86,13 +115,29 @@ class ClaudeRunner {
     prompt,
   ]);
 
-  Future<ClaudeRun> _run(List<String> arguments) async {
-    final renderer = StreamRenderer(ansi: _ansi);
+  Future<ClaudeRun> classify(String prompt) => _run([
+    '--agent',
+    'intake',
+    '--dangerously-skip-permissions',
+    '--output-format',
+    'stream-json',
+    '--verbose',
+    '-p',
+    prompt,
+  ]);
+
+  Future<ClaudeRun> _run(
+    List<String> arguments, {
+    int contextWindow = 200000,
+  }) async {
+    final renderer = StreamRenderer(ansi: _ansi, contextWindow: contextWindow);
     await _proc.stream('claude', arguments, onLine: renderer.onLine);
     return ClaudeRun(
       transcript: renderer.transcript,
       result: renderer.result,
       rateLimited: renderer.rateLimited,
+      peakContextTokens: renderer.peakContextTokens,
+      contextWindow: contextWindow,
     );
   }
 }

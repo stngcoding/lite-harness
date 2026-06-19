@@ -81,6 +81,17 @@ void main() {
     test('ignores references outside the Blocked by section', () {
       expect(blockersOf('## Blocked by\n#3\n\n## Context\nsee #8\n'), [3]);
     });
+
+    test('"None" with prose mentioning issues yields no blockers', () {
+      expect(
+        blockersOf('## Blocked by\nNone — can start on the PR #338 branch.\n'),
+        isEmpty,
+      );
+      expect(
+        blockersOf('## Blocked by\nNone - spine for #337/#338/#339.\n'),
+        isEmpty,
+      );
+    });
   });
 
   group('umbrellaNumbers', () {

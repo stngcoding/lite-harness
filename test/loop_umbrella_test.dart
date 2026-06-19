@@ -3,6 +3,12 @@ import 'dart:io';
 import 'package:dartralph/dartralph.dart';
 import 'package:test/test.dart';
 
+/// A trace store pointed at a throwaway temp file so loop tests never write
+/// into the repo's `.dartralph/`.
+TraceStore _tempTraces() => TraceStore(
+  '${Directory.systemTemp.createTempSync('lh-trace').path}/t.jsonl',
+);
+
 const _okResult = ResultEvent(
   subtype: 'success',
   isError: false,
@@ -41,6 +47,8 @@ class FakeGh extends GhCli {
   final prBase = <String, String>{};
   final prBody = <String, String>{};
   final readyMarked = <String>[];
+  final draftMarked = <String>[];
+  final closedChunkPrs = <int>[];
   var prCount = 0;
 
   @override
@@ -111,26 +119,27 @@ class FakeGh extends GhCli {
   Future<void> markPrReady(String ref) async {
     readyMarked.add(ref);
   }
+
+  @override
+  Future<void> markPrDraft(String ref) async {
+    draftMarked.add(ref);
+  }
+
+  @override
+  Future<void> closeChunkPrs(int parent) async {
+    closedChunkPrs.add(parent);
+  }
 }
 
 class FakeGit extends GitOps {
-  FakeGit({
-    this.drift = false,
-    this.defaultDelta = 10,
-    Map<String, int>? deltas,
-    List<String>? branches,
-  }) : deltas = deltas ?? const {},
-       _branches = branches,
-       super(ProcessRunner());
+  FakeGit({this.drift = false, List<String>? branches})
+    : _branches = branches,
+      super(ProcessRunner());
 
   final bool drift;
 
-  /// Per-commit line delta `commitLog` reports; SHAs default to [defaultDelta].
-  final int defaultDelta;
-  final Map<String, int> deltas;
   final List<String>? _branches;
   final commits = <String>[];
-  final carved = <String>[];
   String _current = '263-prd';
 
   @override
@@ -152,13 +161,6 @@ class FakeGit extends GitOps {
   }
 
   @override
-  Future<bool> checkoutNewAt(String branch, String sha) async {
-    carved.add(branch);
-    _current = branch;
-    return true;
-  }
-
-  @override
   Future<String> head() async => 'BASE';
   @override
   Future<String> currentBranch() async => _current;
@@ -175,13 +177,6 @@ class FakeGit extends GitOps {
   @override
   Future<int> aheadOf(String base) async => commits.length;
   @override
-  Future<List<String>> commitLog(String base) async => [
-    for (var i = 0; i < commits.length; i++) 'c$i',
-  ];
-  @override
-  Future<int> diffLineDelta(String from, String to) async =>
-      deltas[to] ?? defaultDelta;
-  @override
   Future<List<String>> localBranches() async => _branches ?? const ['263-prd'];
   @override
   Future<void> tagFail(int issueNumber) async {}
@@ -194,6 +189,10 @@ class FakeClaude extends ClaudeRunner {
 
   final implemented = <int>[];
   var verifyCount = 0;
+
+  /// When false, the PR review emits `VERDICT: FAIL` so the loop keeps the PRD
+  /// as a single draft PR instead of splitting it into a stack.
+  bool verifyPass = true;
 
   @override
   Future<ClaudeRun> implement({
@@ -208,8 +207,15 @@ class FakeClaude extends ClaudeRunner {
   @override
   Future<ClaudeRun> verify(String prompt) async {
     verifyCount++;
-    return const ClaudeRun(transcript: 'VERDICT: PASS', result: _okResult);
+    return ClaudeRun(
+      transcript: verifyPass ? 'VERDICT: PASS' : 'VERDICT: FAIL',
+      result: _okResult,
+    );
   }
+
+  @override
+  Future<ClaudeRun> classify(String prompt) async =>
+      const ClaudeRun(transcript: 'LANE: normal', result: _okResult);
 }
 
 class FakeProc extends ProcessRunner {
@@ -224,6 +230,7 @@ PromptLibrary _prompts() => PromptLibrary(
   }),
   verifier: PromptTemplate('verifier', 'v', const {}),
   prVerifier: PromptTemplate('pr-verifier', 'p', const {}),
+  intake: PromptTemplate('intake', 'i', const {}),
 );
 
 const _config = Config(
@@ -247,6 +254,7 @@ HarnessLoop _loop(
   proc: FakeProc(),
   prompts: _prompts(),
   events: events,
+  traces: _tempTraces(),
 );
 
 void main() {
@@ -345,7 +353,9 @@ void main() {
       expect(names.last, 'DONE');
       expect(names, contains('UMBRELLA_DROP'));
       expect(names, containsAllInOrder(['IMPLEMENT', 'COMMIT', 'CLOSE']));
-      expect(names, containsAllInOrder(['PR_OPEN', 'PR_REVIEW', 'PR_READY']));
+      // Review runs over the whole diff before any PR is opened; a green
+      // verdict then opens the PR and marks it ready.
+      expect(names, containsAllInOrder(['PR_REVIEW', 'PR_OPEN', 'PR_READY']));
       expect(
         lines.firstWhere((l) => l.contains(' UMBRELLA_DROP ')),
         contains('prd=263 issue=263'),
@@ -357,7 +367,7 @@ void main() {
     });
   });
 
-  group('PR splitting', () {
+  group('single PR per PRD (no split)', () {
     Map<int, Box> threeSlices() => {
       263: Box(263, 'PRD', '', {'ready-for-agent'}, true),
       264: Box(264, 'Slice1', '## Parent\n#263\n', {'ready-for-agent'}, true),
@@ -369,118 +379,71 @@ void main() {
       }, true),
     };
 
-    test('large PRD opens a chain of stacked PRs, only the last Closes the '
-        'parent', () async {
+    test('a large PRD opens exactly one PR on the canonical branch', () async {
       final gh = FakeGh(threeSlices());
       final claude = FakeClaude();
-      // 3 slices × 500 lines each > 800 → one commit per chunk.
-      final git = FakeGit(drift: true, defaultDelta: 500);
+      final git = FakeGit(drift: true);
 
       final code = await _loop(gh, claude, git).run();
 
       expect(code, 0);
       expect(claude.implemented, [264, 265, 266]);
-      expect(gh.prCount, 3);
-      // Bases chain: dev → chunk1 → chunk2 → canonical.
-      expect(gh.prBase['263-chunk-1-of-3-prd'], 'dev');
-      expect(gh.prBase['263-chunk-2-of-3-prd'], '263-chunk-1-of-3-prd');
-      expect(gh.prBase['263-prd'], '263-chunk-2-of-3-prd');
-      // Only the final (canonical) PR closes the parent.
-      expect(gh.prBody['263-prd'], contains('Closes #263'));
-      expect(gh.prBody['263-chunk-1-of-3-prd'], isNot(contains('Closes')));
-      expect(gh.prBody['263-chunk-2-of-3-prd'], isNot(contains('Closes')));
-      // Each chunk PR is reviewed over its own slice; every PR is marked ready.
-      expect(claude.verifyCount, 3);
-      expect(
-        gh.readyMarked,
-        containsAll(<String>[
-          'pr-263-chunk-1-of-3-prd',
-          'pr-263-chunk-2-of-3-prd',
-          'pr-263-prd',
-        ]),
-      );
-    });
-
-    test('a small PRD stays a single PR (no split)', () async {
-      final boxes = {
-        263: Box(263, 'PRD', '', {'ready-for-agent'}, true),
-        264: Box(264, 'Slice1', '## Parent\n#263\n', {'ready-for-agent'}, true),
-        265: Box(265, 'Slice2', '## Parent\n#263\n\n## Blocked by\n#264\n', {
-          'ready-for-agent',
-        }, true),
-      };
-      final gh = FakeGh(boxes);
-      // 2 × 100 = 200 lines < 800 → no split.
-      final git = FakeGit(drift: true, defaultDelta: 100);
-
-      await _loop(gh, FakeClaude(), git).run();
-
+      // No split: one whole-PRD PR that closes the parent, marked ready once.
       expect(gh.prCount, 1);
       expect(gh.prByBranch.keys, contains('263-prd'));
       expect(gh.prBody['263-prd'], contains('Closes #263'));
-      expect(git.carved, isEmpty);
-    });
-
-    test('an oversized single slice becomes its own chunk', () async {
-      final boxes = {
-        263: Box(263, 'PRD', '', {'ready-for-agent'}, true),
-        264: Box(264, 'Slice1', '## Parent\n#263\n', {'ready-for-agent'}, true),
-        265: Box(265, 'Slice2', '## Parent\n#263\n\n## Blocked by\n#264\n', {
-          'ready-for-agent',
-        }, true),
-      };
-      final gh = FakeGh(boxes);
-      // First commit alone exceeds the threshold; it is isolated in chunk 1.
-      final git = FakeGit(
-        drift: true,
-        defaultDelta: 50,
-        deltas: const {'c0': 900},
-      );
-
-      await _loop(gh, FakeClaude(), git).run();
-
-      expect(gh.prCount, 2);
-      expect(git.carved, contains('263-chunk-1-of-2-prd'));
-      expect(gh.prBase['263-chunk-1-of-2-prd'], 'dev');
-      expect(gh.prBase['263-prd'], '263-chunk-1-of-2-prd');
-      expect(gh.prBody['263-prd'], contains('Closes #263'));
-    });
-
-    test('re-run reuses chunks that already have a PR (idempotent)', () async {
-      final gh = FakeGh(threeSlices());
-      // Simulate a prior run that already opened chunk 1's PR.
-      gh.prByBranch['263-chunk-1-of-3-prd'] = 'old-1';
-      final git = FakeGit(drift: true, defaultDelta: 500);
-
-      await _loop(gh, FakeClaude(), git).run();
-
-      // Only the two missing chunks get a fresh createDraftPr.
-      expect(gh.prCount, 2);
-      expect(git.carved, isNot(contains('263-chunk-1-of-3-prd')));
-      expect(gh.prBase['263-chunk-2-of-3-prd'], '263-chunk-1-of-3-prd');
-      expect(gh.readyMarked, contains('old-1'));
+      expect(gh.prBase['263-prd'], 'dev');
+      expect(claude.verifyCount, 1);
+      expect(gh.readyMarked, ['pr-263-prd']);
+      // Leftover chunk PRs from an older split run are swept on the way.
+      expect(gh.closedChunkPrs, contains(263));
     });
 
     test(
-      'stranded sweep prefers the canonical branch over a chunk branch',
+      'a red review demotes the PRD to draft, never opens a second PR',
       () async {
-        // Parent open, no ready slices, branch never PR'd → stranded. Both the
-        // canonical and a leftover chunk branch exist locally.
-        final gh = FakeGh({263: Box(263, 'PRD', '', <String>{}, true)});
-        final git = FakeGit(
-          drift: true,
-          defaultDelta: 500,
-          branches: const ['263-chunk-1-of-2-prd', '263-prd'],
-        )..commits.addAll(['a', 'b', 'c']);
+        final gh = FakeGh(threeSlices());
+        final claude = FakeClaude()..verifyPass = false;
+        final git = FakeGit(drift: true);
 
-        await _loop(gh, FakeClaude(), git).run();
+        final code = await _loop(gh, claude, git).run();
 
-        // _maybeOpenPr ran on the canonical branch (slug 'prd'), so the stack is
-        // named correctly and the closing PR is the canonical one.
-        expect(gh.prBase.containsKey('263-prd'), isTrue);
-        expect(gh.prBody['263-prd'], contains('Closes #263'));
-        expect(git.carved, contains('263-chunk-1-of-3-prd'));
+        expect(code, 0);
+        expect(claude.verifyCount, 1);
+        expect(gh.prCount, 1);
+        expect(gh.prByBranch.keys, contains('263-prd'));
+        expect(gh.readyMarked, isEmpty);
+        expect(gh.draftMarked, ['pr-263-prd']);
       },
     );
+
+    test('a re-run reuses the existing canonical PR (idempotent)', () async {
+      final gh = FakeGh(threeSlices());
+      // A prior run already opened the PRD's one PR.
+      gh.prByBranch['263-prd'] = 'old-263';
+      final git = FakeGit(drift: true);
+
+      await _loop(gh, FakeClaude(), git).run();
+
+      // No fresh createDraftPr — the existing PR is updated and marked ready.
+      expect(gh.prCount, 0);
+      expect(gh.readyMarked, ['old-263']);
+    });
+
+    test('stranded sweep ignores leftover chunk branches', () async {
+      // Parent open, no ready slices, branch never PR'd → stranded. A leftover
+      // chunk branch sits beside the canonical one; only the canonical is PR'd.
+      final gh = FakeGh({263: Box(263, 'PRD', '', <String>{}, true)});
+      final git = FakeGit(
+        drift: true,
+        branches: const ['263-chunk-1-of-2-prd', '263-prd'],
+      )..commits.addAll(['a', 'b', 'c']);
+
+      await _loop(gh, FakeClaude(), git).run();
+
+      expect(gh.prByBranch.keys, contains('263-prd'));
+      expect(gh.prByBranch.keys, isNot(contains('263-chunk-1-of-2-prd')));
+      expect(gh.prBody['263-prd'], contains('Closes #263'));
+    });
   });
 }

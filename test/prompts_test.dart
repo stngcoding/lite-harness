@@ -77,18 +77,7 @@ String _expectedPrVerifier(
   String base, {
   required String repo,
   required String prRef,
-  int? chunkIndex,
-  int? chunkTotal,
 }) {
-  final stackNote = chunkIndex == null || chunkTotal == null
-      ? 'Judge the PRD as a whole: the slices must fit together with no '
-            'contradictions or integration gaps, and satisfy the PRD\'s intent.'
-      : 'This PR is chunk $chunkIndex/$chunkTotal of a stacked split of one '
-            'PRD; the range is ONLY this chunk\'s slice. Earlier chunks are '
-            'already in its base and later chunks build on top, so review just '
-            'this slice and do NOT flag incompleteness that a later chunk '
-            'resolves (a symbol defined here and used later, a feature '
-            'finished in a later chunk).';
   return '''
 You are reviewing the FULL pull request for PRD #$parent: $title.
 
@@ -104,7 +93,7 @@ the under-80 filter, then the cited review comment. This is read-only — do NOT
 edit any file. Cite each surviving issue with a permalink under $repo built
 from the full `git rev-parse HEAD` SHA.
 
-$stackNote FAIL only for the blocking
+Judge the PRD as a whole: the slices must fit together with no contradictions or integration gaps, and satisfy the PRD's intent. FAIL only for the blocking
 problems your instructions define; report surviving nits as non-blocking notes.
 
 ## Verdict
@@ -298,37 +287,63 @@ void main() {
         ).trim(),
       );
     });
+  });
 
-    test(
-      'pr-verifier — a stacked chunk scopes the note to its slice',
-      () async {
-        final lib = await defaults();
-        final out = lib.prVerifier(
-          42,
-          'My PRD',
-          '42-chunk-1-of-3-my-prd',
-          repo: 'octo/app',
-          prRef: 'https://github.com/octo/app/pull/8',
-          chunkIndex: 2,
-          chunkTotal: 3,
-        );
-        expect(
-          out.trim(),
-          _expectedPrVerifier(
-            42,
-            'My PRD',
-            '42-chunk-1-of-3-my-prd',
-            repo: 'octo/app',
-            prRef: 'https://github.com/octo/app/pull/8',
-            chunkIndex: 2,
-            chunkTotal: 3,
-          ).trim(),
-        );
-        // The chunk note replaces the whole-PRD framing and names the slice.
-        expect(out, contains('chunk 2/3 of a stacked split'));
-        expect(out, isNot(contains('Judge the PRD as a whole')));
-        expect(out, contains('origin/42-chunk-1-of-3-my-prd..HEAD'));
-      },
-    );
+  group('risk lane', () {
+    Future<PromptLibrary> defaults() async {
+      final root = await Directory.systemTemp.createTemp('lh-risk');
+      addTearDown(() => root.delete(recursive: true));
+      return PromptLibrary.load(repoRoot: root);
+    }
+
+    test('implementer injects a high-risk block only for high-risk', () async {
+      final lib = await defaults();
+      final issue = _issue();
+      final none = lib.implementer(issue: issue, comments: '');
+      expect(none, isNot(contains('<risk')));
+
+      for (final lane in [RiskLane.tiny, RiskLane.normal]) {
+        final out = lib.implementer(issue: issue, comments: '', lane: lane);
+        expect(out, isNot(contains('<risk')), reason: '$lane adds no block');
+      }
+
+      final high = lib.implementer(
+        issue: issue,
+        comments: '',
+        lane: RiskLane.highRisk,
+      );
+      expect(high, contains('<risk lane="high-risk">'));
+      expect(high, contains('HIGH-RISK'));
+    });
+
+    test('pr-verifier tightens the bar only for high-risk', () async {
+      final lib = await defaults();
+      String pr(RiskLane? lane) => lib.prVerifier(
+        1,
+        'PRD',
+        'dev',
+        repo: 'o/r',
+        prRef: 'url',
+        lane: lane,
+      );
+      for (final lane in [null, RiskLane.tiny, RiskLane.normal]) {
+        expect(pr(lane), isNot(contains('HIGH-RISK')));
+      }
+      expect(pr(RiskLane.highRisk), contains('HIGH-RISK'));
+      expect(pr(RiskLane.highRisk), contains('Tighten your bar'));
+    });
+
+    test('intake renders the issue and PRD context', () async {
+      final lib = await defaults();
+      final out = lib.intake(
+        issue: _issue(number: 7, title: 'Wire auth'),
+        prdContext: '## PRD #3: Login',
+      );
+      expect(out, contains('## GitHub Issue #7: Wire auth'));
+      expect(out, contains('## PRD #3: Login'));
+      expect(out, contains('Labels: enhancement, ready-for-agent'));
+      expect(out, contains('FLAGS:'));
+      expect(out, contains('LANE:'));
+    });
   });
 }
