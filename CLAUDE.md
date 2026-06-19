@@ -6,7 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `dartralph` is a Dart CLI that automates draining a PRD's `ready-for-agent`
 GitHub sub-issues: it runs the `claude` CLI per issue, gates each slice
-(analyze + tests + an independent reviewer), then opens one PR per PRD. It is a
+(analyze + scoped tests), then opens one PR per PRD that an independent reviewer
+gates as a whole. It is a
 Dart port of `legacy/my-ralph.sh`. The harness itself is a Dart package, but it
 is **run from inside a target repo clone** and its gates assume that target is a
 Flutter project (`fvm flutter analyze` / `fvm flutter test`).
@@ -112,7 +113,12 @@ tests — this is the code to touch carefully:
    pipeline — triage → five independent review lenses (CLAUDE.md, bug scan, git
    history, prior PRs, in-code comments) fanned out via `Task` → per-issue 0–100
    confidence scoring → drop everything below 80 → a cited PASS/FAIL. It still
-   ends in the single bare `VERDICT:` line the harness reads.
+   ends in the single bare `VERDICT:` line the harness reads. The reviewer also
+   emits `MANUAL:` lines for acceptance criteria the gates cannot settle from the
+   diff (UI, real-device perf, external-service behavior); `manualNotes`
+   (`manual_notes.dart`) parses them and `_manualSection` renders them as an
+   unchecked checklist on the draft PR for the human reviewer — surfaced, never
+   gated on.
 5. **Stranded-PRD sweep.** After the ready queue empties, `_shipStrandedPrds`
    walks local `<parent#>-<slug>` branches and PRs any whose parent is still
    OPEN, has no open managed subs, commits ahead, and no existing open PR. This

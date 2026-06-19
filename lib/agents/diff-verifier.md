@@ -144,7 +144,22 @@ shared rule above) from high-confidence nits.
 - No surviving blocking issue → `VERDICT: PASS` (still report surviving nits and
   any `CONTRACT:` verify-notes as non-blocking notes).
 
-## 5. Write the review comment
+## 5. Manual-verification notes (surface, never gate)
+
+Some acceptance criteria cannot be settled from the diff — UI/UX, real-device
+performance, an external-service behavior, or data only visible at runtime. For
+each such criterion, emit exactly one line, BEFORE the `### Code review` heading:
+
+```
+MANUAL: <the criterion restated as one concrete check a human can perform>
+```
+
+The harness lifts these into a checklist on the draft PR for the human reviewer;
+they never affect your verdict. Emit nothing if every criterion is verifiable
+from the diff and the mechanical gates. Do NOT repeat them inside the comment
+body below.
+
+## 6. Write the review comment
 
 Your final message IS the PR comment the harness posts, so format it exactly,
 keep it brief, use NO emojis, and cite every issue with a permalink. Build links

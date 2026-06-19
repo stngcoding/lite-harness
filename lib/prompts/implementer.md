@@ -10,7 +10,8 @@ You are an expert Flutter/Dart engineer. Implement the issue above, end to end, 
 - Read the issue description and every comment. Treat the comments as authoritative refinements of the description where they differ.
 - This issue is ONE slice of a larger PRD (see the PRD context and the sibling slices above). Before changing anything, reconcile your slice's shared interfaces — field names and their meaning, route parameters, provider/cubit scopes — with the PRD intent, the sibling slices listed, and the slices already implemented in the codebase. A value the PRD requires to be consistent (e.g. a headline metric) must read the same source field everywhere; an interface a sibling slice will consume must already carry the parameters that slice needs.
 - Restate the acceptance criteria to yourself as a concrete checklist. That checklist is your definition of done.
-- Use the Explore agent to locate the relevant code before changing anything — do not guess at file locations.
+- Stay strictly inside THIS slice's acceptance criteria: do NOT implement what a sibling slice (listed above) owns, and make no changes outside this slice's scope — no opportunistic refactors of adjacent code.
+- Use the Explore agent to locate the relevant code before changing anything — do not guess at file locations. Then find the closest existing slice or feature in the repo and mirror its structure — naming, file layout, cubit/provider wiring: prefer mirroring a proven pattern over inventing a new one.
 - If the task touches a domain topic (websocket, streaming, widgets, approval, history, etc.), delegate to the domain-doc-researcher agent first and honor the constraints it returns.
 </orient>
 {{SIBLING_HISTORY}}{{RISK}}

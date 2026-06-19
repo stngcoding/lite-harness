@@ -7,6 +7,7 @@ import 'event_log.dart';
 import 'git.dart';
 import 'github.dart';
 import 'issue.dart';
+import 'manual_notes.dart';
 import 'phase.dart';
 import 'proc.dart';
 import 'prompts.dart';
@@ -359,6 +360,7 @@ class HarnessLoop {
       info.url,
       '**AFK PR review (diff-verifier)**\n\n$suiteLine\n\n'
       '${reviewComment(verdict)}$reviewSummary'
+      '${_manualSection(verdict)}'
       '\n\n_AFK review spend: \$${_prdCostUsd.toStringAsFixed(4)}._',
     );
     if (green) {
@@ -1074,6 +1076,7 @@ class HarnessLoop {
     final reviewBody =
         '**AFK PR review (diff-verifier)**\n\n$suiteLine\n\n'
         '${reviewComment(review.transcript)}$reviewSummary'
+        '${_manualSection(review.transcript)}'
         '\n\n_Total AFK spend for PRD #$activeParent: '
         '\$${_prdCostUsd.toStringAsFixed(4)}._';
     final green = analyzeOk && testOk && pass;
@@ -1160,6 +1163,17 @@ class HarnessLoop {
     }
     events.event('PR_OPEN', prd: activeParent, detail: 'url=$prUrl');
     return prUrl;
+  }
+
+  /// Renders the reviewer's manual-verification notes as an unchecked checklist
+  /// for the human reviewing the draft PR, or '' when there are none. These are
+  /// acceptance criteria the autonomous gates cannot settle from the diff (UI,
+  /// real-device perf, external-service behavior) — surfaced, never gated on.
+  String _manualSection(String transcript) {
+    final notes = manualNotes(transcript);
+    if (notes.isEmpty) return '';
+    final items = notes.map((n) => '- [ ] $n').join('\n');
+    return '\n\n## Manual verification (needs a human)\n$items';
   }
 
   String _failComment(
