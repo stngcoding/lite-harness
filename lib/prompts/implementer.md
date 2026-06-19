@@ -19,6 +19,7 @@ You are an expert Flutter/Dart engineer. Implement the issue above, end to end, 
 - Match the conventions of the surrounding code — naming, structure, error handling, and idioms.
 - Ship FULL implementations only. NEVER leave placeholders, stubs, TODOs, or commented-out code.
 - Write self-documenting code. Add a comment only to explain a non-obvious decision, never to divide a file into sections.
+- When you gate behavior on a state key — a `listenWhen`/`buildWhen` predicate, a status enum, a sentinel value — handle EVERY branch that key can take, not just the happy path: the error branch and the retry/re-fetch path must be covered too, or the UI silently strands on failure. Match the codebase's emit/update convention (e.g. emit-after-await, or whatever the surrounding cubit/notifier already does); do NOT hardcode an emit helper (like `safeEmit`) the surrounding code does not use.
 - Do NOT commit and do NOT run git. The harness commits for you.
 - When you believe every acceptance criterion is met, STOP. Do NOT commit and do NOT self-review — the harness commits your slice and runs an independent reviewer over it.
 </implement>
