@@ -350,7 +350,33 @@ void main() {
       );
       expect(high, contains('<risk lane="high-risk">'));
       expect(high, contains('HIGH-RISK'));
+      expect(high, contains('First write a short PLAN inline'));
+      // The plan-first instruction is part of the high-risk block, so the
+      // normal/tiny lanes (asserted free of `<risk` above) never see it.
+      expect(none, isNot(contains('First write a short PLAN')));
     });
+
+    test(
+      'implementer injects known pitfalls only when there are any',
+      () async {
+        final lib = await defaults();
+        final issue = _issue();
+        final none = lib.implementer(issue: issue, comments: '');
+        expect(none, isNot(contains('known-pitfalls')));
+
+        final out = lib.implementer(
+          issue: issue,
+          comments: '',
+          pitfalls: const [
+            'error • Undefined name foo • undefined_identifier',
+            'Expected: <2> Actual: <3>',
+          ],
+        );
+        expect(out, contains('<known-pitfalls>'));
+        expect(out, contains('- error • Undefined name foo'));
+        expect(out, contains('- Expected: <2> Actual: <3>'));
+      },
+    );
 
     test('pr-verifier tightens the bar only for high-risk', () async {
       final lib = await defaults();

@@ -27,6 +27,31 @@ void main() {
       expect(parsed.detail, 'analyze=1 test=0');
     });
 
+    test('round-trips the signature field and omits it when null', () {
+      const withSig = TraceRecord(
+        ts: 't',
+        lane: RiskLane.normal,
+        outcome: 'fail',
+        attempts: 1,
+        frictions: [FrictionKind.gateTestFail],
+        signature: 'Expected: <2> Actual: <3>',
+      );
+      expect(
+        TraceRecord.parse(withSig.toJsonLine()).signature,
+        'Expected: <2> Actual: <3>',
+      );
+
+      const noSig = TraceRecord(
+        ts: 't',
+        lane: RiskLane.tiny,
+        outcome: 'pass',
+        attempts: 1,
+        frictions: [],
+      );
+      expect(noSig.toJsonLine(), isNot(contains('signature')));
+      expect(TraceRecord.parse(noSig.toJsonLine()).signature, isNull);
+    });
+
     test('omits null issue/prd/detail and parses them back as null', () {
       const record = TraceRecord(
         ts: '2026-06-18T08:00:00.000',
@@ -151,6 +176,80 @@ void main() {
       final out = summarize([rec(RiskLane.tiny, 'pass', [])]).render();
       expect(out, contains('Nothing to propose'));
       expect(out, contains('1 traces'));
+    });
+  });
+
+  group('errorSignature', () {
+    test('prefers a flutter analyze error row over earlier noise', () {
+      const log =
+          'Analyzing app...\n\n'
+          '  info • Unused import • lib/a.dart:1:8 • unused_import\n'
+          '  error • Undefined name foo • lib/b.dart:9:3 • undefined_identifier\n';
+      expect(errorSignature(log), contains('Undefined name foo'));
+      expect(errorSignature(log), startsWith('error •'));
+    });
+
+    test('matches a test matcher Expected line', () {
+      const log =
+          '00:01 +0 -1: widget paints [E]\nExpected: <2>\n  Actual: <3>';
+      // The compact reporter `[E]` line is the first marker hit.
+      expect(errorSignature(log), '00:01 +0 -1: widget paints [E]');
+    });
+
+    test('falls back to the first non-empty line and clips to 120 chars', () {
+      final long = 'x' * 200;
+      expect(errorSignature('\n\n$long'), hasLength(120));
+      expect(errorSignature('just a note'), 'just a note');
+      expect(errorSignature('   \n  '), isNull);
+    });
+  });
+
+  group('recurringSignatures', () {
+    TraceRecord sig(String? s) => TraceRecord(
+      ts: 't',
+      lane: RiskLane.normal,
+      outcome: 'fail',
+      attempts: 1,
+      frictions: const [],
+      signature: s,
+    );
+
+    test(
+      'surfaces signatures recurring >= minCount, normalizing line numbers',
+      () {
+        final out = recurringSignatures([
+          sig(
+            'error • Undefined name foo • lib/a.dart:9:3 • undefined_identifier',
+          ),
+          sig(
+            'error • Undefined name foo • lib/b.dart:42:7 • undefined_identifier',
+          ),
+          sig('error • Missing return • lib/c.dart:1:1 • missing_return'),
+        ]);
+        // The two `Undefined name foo` lines fingerprint the same despite
+        // different paths/line numbers; the one-off `Missing return` drops out.
+        expect(out, hasLength(1));
+        expect(out.single, contains('Undefined name foo'));
+      },
+    );
+
+    test('caps at top and ignores null signatures', () {
+      final records = [
+        sig(null),
+        sig(null),
+        for (var i = 0; i < 4; i++) ...[sig('err alpha'), sig('err alpha')],
+      ];
+      // Only one distinct recurring signature here, so top has no effect, but
+      // null entries must not crash or count.
+      expect(recurringSignatures(records), ['err alpha']);
+    });
+
+    test('respects the recency window', () {
+      final old = [sig('old boom'), sig('old boom')];
+      final recent = List.generate(50, (_) => sig('fresh bang'));
+      // window=50 keeps only the recent block; the old recurring sig ages out.
+      final out = recurringSignatures([...old, ...recent], window: 50);
+      expect(out, ['fresh bang']);
     });
   });
 }

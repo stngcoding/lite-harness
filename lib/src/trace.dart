@@ -22,6 +22,7 @@ enum FrictionKind {
   commitFail,
   apiError,
   classifyFail,
+  contextStarved,
 }
 
 /// One issue's (or PR's) outcome for a run: its risk lane, how many attempts it
@@ -36,6 +37,7 @@ class TraceRecord {
     this.issue,
     this.prd,
     this.detail,
+    this.signature,
   });
 
   factory TraceRecord.parse(String line) {
@@ -52,6 +54,7 @@ class TraceRecord {
           FrictionKind.values.byName(f as String),
       ],
       detail: json['detail'] as String?,
+      signature: json['signature'] as String?,
     );
   }
 
@@ -66,6 +69,11 @@ class TraceRecord {
   final List<FrictionKind> frictions;
   final String? detail;
 
+  /// One-line error signature for a non-pass outcome (the first failing line of
+  /// the analyze/test log), or null for a clean pass. This is the high-signal
+  /// bit [recurringSignatures] aggregates into the implementer's pitfalls digest.
+  final String? signature;
+
   String toJsonLine() => jsonEncode({
     'ts': ts,
     if (issue != null) 'issue': issue,
@@ -75,6 +83,7 @@ class TraceRecord {
     'attempts': attempts,
     'frictions': [for (final f in frictions) f.name],
     if (detail != null) 'detail': detail,
+    if (signature != null) 'signature': signature,
   });
 }
 
@@ -196,6 +205,9 @@ const _suggestions = <FrictionKind, String>{
   FrictionKind.classifyFail:
       'Intake classification kept failing to emit a lane — check the intake '
       'agent and prompt.',
+  FrictionKind.contextStarved:
+      'Slices ran the context window low before failing — they are likely too '
+      'large; split them into smaller sub-issues.',
 };
 
 /// Aggregates [records] into a [FrictionReport]: friction counts, per-lane
@@ -235,4 +247,72 @@ FrictionReport summarize(List<TraceRecord> records) {
     laneStats: laneStats,
     proposals: proposals,
   );
+}
+
+String _clip(String s) => s.length <= 120 ? s : '${s.substring(0, 117)}...';
+
+/// Lines that look like the actual failure rather than progress/noise, in
+/// priority order: a `flutter analyze` error row, a test matcher's `Expected:`,
+/// the compact reporter's `[E]` failure marker, or a thrown error/exception.
+final _errorMarkers = [
+  RegExp(r'error\s+•'),
+  RegExp(r'^Expected:'),
+  RegExp(r'\[E\]$'),
+  RegExp(r'(?:Exception|Error):'),
+  RegExp(r'^FAILED\b|Failed to'),
+];
+
+/// Extracts a one-line error signature from a gate [log]: the first line
+/// matching an [_errorMarkers] pattern, else the first non-empty line. Clipped
+/// to 120 chars so a trace stays a single high-signal line. Null for empty input.
+String? errorSignature(String log) {
+  String? firstNonEmpty;
+  for (final raw in log.split('\n')) {
+    final line = raw.trim();
+    if (line.isEmpty) continue;
+    firstNonEmpty ??= line;
+    for (final marker in _errorMarkers) {
+      if (marker.hasMatch(line)) return _clip(line);
+    }
+  }
+  return firstNonEmpty == null ? null : _clip(firstNonEmpty);
+}
+
+/// A volatility-stripped fingerprint so the same *class* of failure recurs even
+/// when it lands in a different file or at a different line (file-path tokens
+/// dropped, digits → `#`, whitespace collapsed). The discriminating parts — an
+/// analyze rule name, a matcher message — survive and key the recurrence count.
+String _fingerprint(String signature) => signature
+    .toLowerCase()
+    .replaceAll(RegExp(r'\S*\.dart\S*'), '')
+    .replaceAll(RegExp(r'\d+'), '#')
+    .replaceAll(RegExp(r'\s+'), ' ')
+    .trim();
+
+/// Error signatures that recurred at least [minCount] times within the most
+/// recent [window] traces, most-frequent first, capped at [top]. A single
+/// failure is noise; the same class recurring is a real repo pitfall — this is
+/// the source of the implementer's "known pitfalls" digest. Each returned string
+/// is the most recent raw signature for its fingerprint (a concrete example).
+List<String> recurringSignatures(
+  List<TraceRecord> records, {
+  int window = 50,
+  int minCount = 2,
+  int top = 3,
+}) {
+  final recent = records.length > window
+      ? records.sublist(records.length - window)
+      : records;
+  final counts = <String, int>{};
+  final representative = <String, String>{};
+  for (final r in recent) {
+    final sig = r.signature;
+    if (sig == null || sig.isEmpty) continue;
+    final key = _fingerprint(sig);
+    counts[key] = (counts[key] ?? 0) + 1;
+    representative[key] = sig;
+  }
+  final ranked = counts.entries.where((e) => e.value >= minCount).toList()
+    ..sort((a, b) => b.value.compareTo(a.value));
+  return [for (final e in ranked.take(top)) representative[e.key]!];
 }

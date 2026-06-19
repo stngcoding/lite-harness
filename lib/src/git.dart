@@ -84,6 +84,17 @@ class GitOps {
         .toList();
   }
 
+  /// The full patch text of the slice's commit range ([baseline]..HEAD) — fed
+  /// back to the implementer on a retry so it sees what its previous attempt
+  /// actually changed instead of re-deriving blind. Artifacts are already
+  /// excluded by [commitAll], so the committed range carries none.
+  Future<String> diff(String baseline) => _out(['diff', baseline, 'HEAD']);
+
+  /// The `--stat` summary (files + ±counts) of [baseline]..HEAD — the bounded
+  /// fallback used when the full [diff] is too large to inject wholesale.
+  Future<String> diffStat(String baseline) =>
+      _out(['diff', '--stat', baseline, 'HEAD']);
+
   Future<String> currentBranch() => _out(['rev-parse', '--abbrev-ref', 'HEAD']);
 
   Future<bool> commitAll(String message) async {

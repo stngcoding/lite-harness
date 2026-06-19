@@ -31,6 +31,7 @@ class FakeGh extends GhCli {
 
   final closed = <int>[];
   final relabeled = <int>[];
+  final comments = <String>[];
 
   @override
   Future<List<Issue>> readyIssues(String state) async => [_issue()];
@@ -46,7 +47,8 @@ class FakeGh extends GhCli {
   @override
   Future<void> relabelForHuman(int number) async => relabeled.add(number);
   @override
-  Future<void> commentOnIssue(int number, String body) async {}
+  Future<void> commentOnIssue(int number, String body) async =>
+      comments.add(body);
 }
 
 class FakeGit extends GitOps {
@@ -87,8 +89,11 @@ class FakeGit extends GitOps {
 }
 
 class FakeClaude extends ClaudeRunner {
-  FakeClaude() : super(ProcessRunner());
+  FakeClaude({this.peakContextTokens = 0}) : super(ProcessRunner());
 
+  /// Peak context occupancy every implement run reports — 190_000 of a 200_000
+  /// window is ~5% free, below the context-starved threshold.
+  final int peakContextTokens;
   final prompts = <String>[];
 
   @override
@@ -98,7 +103,11 @@ class FakeClaude extends ClaudeRunner {
     String systemAppend = '',
   }) async {
     prompts.add(prompt);
-    return const ClaudeRun(transcript: '', result: _okResult);
+    return ClaudeRun(
+      transcript: '',
+      result: _okResult,
+      peakContextTokens: peakContextTokens,
+    );
   }
 
   @override
@@ -212,6 +221,31 @@ void main() {
       expect(gh.closed, isEmpty);
       expect(gh.relabeled, [9]);
       expect(git.tagged, [9]);
+      // No context-usage was reported, so the handoff must not guess the slice
+      // is too large.
+      expect(gh.comments.single, isNot(contains('likely too large')));
+    },
+  );
+
+  test(
+    'a context-starved failing slice flags itself as too large in the handoff',
+    () async {
+      final gh = FakeGh();
+      final claude = FakeClaude(peakContextTokens: 190000); // ~5% free
+      final git = FakeGit();
+
+      final code = await _loop(
+        gh,
+        claude,
+        git,
+        FailingProc(99),
+        maxAttempts: 1,
+      ).run();
+
+      expect(code, 1);
+      expect(gh.relabeled, [9]);
+      expect(gh.comments.single, contains('likely too large'));
+      expect(gh.comments.single, contains('splitting'));
     },
   );
 }

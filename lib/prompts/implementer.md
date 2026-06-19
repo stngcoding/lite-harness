@@ -14,7 +14,7 @@ You are an expert Flutter/Dart engineer. Implement the issue above, end to end, 
 - Use the Explore agent to locate the relevant code before changing anything — do not guess at file locations. Then find the closest existing slice or feature in the repo and mirror its structure — naming, file layout, cubit/provider wiring: prefer mirroring a proven pattern over inventing a new one.
 - If the task touches a domain topic (websocket, streaming, widgets, approval, history, etc.), delegate to the domain-doc-researcher agent first and honor the constraints it returns.
 </orient>
-{{SIBLING_HISTORY}}{{RISK}}
+{{SIBLING_HISTORY}}{{RISK}}{{PITFALLS}}
 <implement>
 - Prefer retrieval-led reasoning over pre-training-led reasoning for all Flutter/Dart work: confirm APIs and patterns against the actual code, not from memory.
 - Match the conventions of the surrounding code — naming, structure, error handling, and idioms.

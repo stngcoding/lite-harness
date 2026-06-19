@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'context_budget.dart';
 import 'issue.dart';
 import 'proc.dart';
 
@@ -150,11 +151,11 @@ class GhCli {
     try {
       final decoded = jsonDecode(result.stdout) as Map<String, dynamic>;
       final comments = decoded['comments'] as List? ?? const [];
-      return [
+      return clampComments([
         for (final comment in comments.cast<Map<String, dynamic>>())
           '**${(comment['author'] as Map?)?['login']}** '
               '(${comment['createdAt']}):\n${comment['body']}\n',
-      ].join('\n');
+      ], number);
     } on FormatException {
       return '';
     }

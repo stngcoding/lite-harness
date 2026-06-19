@@ -3,6 +3,7 @@ import 'dart:io';
 import 'ansi.dart';
 import 'claude.dart';
 import 'config.dart';
+import 'context_budget.dart';
 import 'event_log.dart';
 import 'git.dart';
 import 'github.dart';
@@ -11,6 +12,7 @@ import 'manual_notes.dart';
 import 'phase.dart';
 import 'proc.dart';
 import 'prompts.dart';
+import 'retry_feedback.dart';
 import 'test_scope.dart';
 import 'trace.dart';
 import 'verdict.dart';
@@ -561,7 +563,7 @@ class HarnessLoop {
     final title = await gh.issueTitle(parent);
     final body = await gh.issueBody(parent);
     final prdContext = StringBuffer('## PRD #$parent: $title');
-    if (body.isNotEmpty) prdContext.write('\n\n$body');
+    if (body.isNotEmpty) prdContext.write('\n\n${clampPrdBody(body, parent)}');
     final siblings =
         (await _openSubsOf(parent)).where((s) => s.number != self).toList()
           ..sort((a, b) => a.number.compareTo(b.number));
@@ -648,11 +650,21 @@ class HarnessLoop {
     var ctxDetail = '';
     var retry = '';
 
+    // The last implement run's context headroom (percent free), so a slice that
+    // failed while starved of context can be flagged as likely too big.
+    double? lastFreePct;
+
+    // The repo's recurring error signatures, fed to the implementer on its first
+    // attempt only (a retry already carries the specific failing logs). Advisory.
+    final pitfalls = recurringSignatures(traces.readAll());
+
     // Appends this slice's single trace at a terminal outcome. Captures
     // [analyzeOk]/[testOk]/[ctxDetail] by reference so the detail reflects the
     // last gate and the last implement run's context headroom. A missing lane
     // only counts as friction on a non-pass outcome (denoise — see above).
-    void recordTrace(String outcome, int attempts) {
+    // [signature] is the one-line gate error this outcome left behind (null on a
+    // pass) — what [recurringSignatures] later aggregates into the digest above.
+    void recordTrace(String outcome, int attempts, {String? signature}) {
       final hit = {...frictions};
       if (laneMissing && outcome != 'pass') hit.add(FrictionKind.classifyFail);
       traces.append(
@@ -666,6 +678,7 @@ class HarnessLoop {
           frictions: hit.toList(),
           detail:
               'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}$ctxDetail',
+          signature: signature,
         ),
       );
     }
@@ -701,6 +714,7 @@ class HarnessLoop {
             base: config.base,
             retry: retry,
             lane: lane,
+            pitfalls: attempt == 1 ? pitfalls : const [],
           ),
           systemAppend: rulesSystemPrompt,
         ),
@@ -712,6 +726,7 @@ class HarnessLoop {
           ? ''
           : '\n\nImplement: ${run.result!.summary}.';
       final freePct = run.contextFreePct;
+      lastFreePct = freePct;
       ctxDetail = freePct == null ? '' : ' ctx=${freePct.round()}%free';
       print('');
 
@@ -805,7 +820,14 @@ class HarnessLoop {
             'attempt=$attempt/${config.maxAttempts} '
             'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}',
       );
-      retry = _retryFeedback(analyzeOk: analyzeOk, testOk: testOk);
+      retry = _retryFeedback(
+        analyzeOk: analyzeOk,
+        testOk: testOk,
+        previousAttempt: previousAttemptBlock(
+          await git.diff(baseline),
+          await git.diffStat(baseline),
+        ),
+      );
       print(
         ansi.red(
           '  #${issue.number} attempt $attempt/${config.maxAttempts} FAILED '
@@ -816,7 +838,16 @@ class HarnessLoop {
 
     // Every attempt failed — preserve the last try and hand off to a human.
     frictions.add(FrictionKind.retryExhausted);
-    recordTrace('fail', config.maxAttempts);
+    // A slice that failed while nearly out of context is likely too big to land
+    // in one pass — flag it so the human (and the friction report) can see it.
+    final contextStarved = lastFreePct != null && lastFreePct < 15;
+    if (contextStarved) frictions.add(FrictionKind.contextStarved);
+    final signature = !analyzeOk && File(_analyzeLog).existsSync()
+        ? errorSignature(File(_analyzeLog).readAsStringSync())
+        : !testOk && File(_testLog).existsSync()
+        ? errorSignature(File(_testLog).readAsStringSync())
+        : null;
+    recordTrace('fail', config.maxAttempts, signature: signature);
     events.event(
       'FAIL',
       prd: prdRef,
@@ -835,6 +866,7 @@ class HarnessLoop {
         analyzeOk: analyzeOk,
         testOk: testOk,
         implementSummary: implementSummary,
+        contextStarved: contextStarved,
       ),
     );
     print(
@@ -854,6 +886,7 @@ class HarnessLoop {
     required bool analyzeOk,
     required bool testOk,
     bool noChanges = false,
+    String previousAttempt = '',
   }) {
     final sections = <String>[];
     if (noChanges) {
@@ -875,7 +908,7 @@ class HarnessLoop {
     return '\n---\n## Previous attempt failed — fix these before finishing\n'
         'A prior automated attempt at this exact issue did not pass the gates. '
         'Treat the errors below as the source of truth and resolve every one '
-        'of them.\n\n${sections.join('\n\n')}\n';
+        'of them.\n\n${sections.join('\n\n')}\n$previousAttempt';
   }
 
   /// The per-issue test gate: runs only the tests the slice's diff scopes to
@@ -1181,17 +1214,23 @@ class HarnessLoop {
     required bool analyzeOk,
     required bool testOk,
     String implementSummary = '',
+    bool contextStarved = false,
   }) {
     final logs = [
       for (final path in [_analyzeLog, _testLog])
         if (File(path).existsSync()) '==> $path <==\n${_tail(path, 20)}',
     ].join('\n\n');
+    final starvedNote = contextStarved
+        ? '\n\n⚠️ The implementer ran low on context (<15% free) before '
+              'failing — this slice is likely too large. Consider splitting it '
+              'into smaller sub-issues.'
+        : '';
     return 'AFK verify FAILED '
         '(analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}).'
         '$implementSummary\n\n'
         'Failed attempt preserved at tag `ralph-fail/$number` '
         '(recover with `git checkout ralph-fail/$number`).\n\n'
-        '**Logs**\n```\n$logs\n```';
+        '**Logs**\n```\n$logs\n```$starvedNote';
   }
 
   String _tail(String path, int count) {

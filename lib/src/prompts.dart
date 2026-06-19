@@ -76,6 +76,7 @@ class PromptLibrary {
     'COMMENTS',
     'RETRY',
     'RISK',
+    'PITFALLS',
   };
   static const _verifierVars = {
     'ISSUE_NUMBER',
@@ -151,6 +152,7 @@ class PromptLibrary {
     String base = '',
     String retry = '',
     RiskLane? lane,
+    List<String> pitfalls = const [],
   }) {
     final labels = issue.labels.join(', ');
     return _implementer.render({
@@ -169,8 +171,21 @@ class PromptLibrary {
       'COMMENTS': comments.isEmpty ? '' : '\n### Comments\n$comments\n',
       'RETRY': retry,
       'RISK': _implementerRisk(lane),
+      'PITFALLS': _pitfalls(pitfalls),
     });
   }
+
+  /// The repo's recurring error signatures, surfaced to the implementer on its
+  /// first attempt only (a retry already carries its own specific failing logs).
+  /// Advisory — it warns against known mistakes, never blocks. Empty list renders
+  /// nothing, so a repo with no recurring friction sees the baseline prompt.
+  static String _pitfalls(List<String> signatures) => signatures.isEmpty
+      ? ''
+      : '\n<known-pitfalls>\n'
+            'These errors recurred across recent slices in this repo. Do NOT '
+            'reintroduce them:\n'
+            '${signatures.map((s) => '- $s').join('\n')}\n'
+            '</known-pitfalls>\n';
 
   /// The risk-lane block injected into the implementer prompt. Only a high-risk
   /// lane raises the bar (the prompt body is already written for the normal
@@ -182,6 +197,9 @@ class PromptLibrary {
           'HIGH-RISK slice (auth, data model / migration, a public contract, '
           'security, an external provider, or existing behavior). Before you '
           'change anything:\n'
+          '- First write a short PLAN inline (the files you will touch, your '
+          'approach, and how it fits the sibling slices and existing '
+          'contracts), then implement it. Do NOT edit code before the plan.\n'
           '- Preserve existing public contracts and persisted data shapes: do '
           'NOT rename or repurpose a shared field, route parameter, or '
           'provider/cubit scope a sibling slice or caller depends on.\n'
