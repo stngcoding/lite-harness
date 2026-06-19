@@ -60,12 +60,17 @@ Assign the issue exactly one lane:
 
 ## Output protocol
 
-End your response with exactly these two lines and nothing after them:
+End your response with exactly these two lines, in this order, with NOTHING after the second:
 
 ```
 FLAGS: <comma-separated flags that fired, or "none">
 LANE: tiny|normal|high-risk
 ```
 
-The `LANE:` line MUST be the final line and exactly one of those three tokens.
-The harness reads only that bare line; prose anywhere above it is ignored.
+The `LANE:` line is load-bearing — the harness parses it by exact string match and ignores everything else. So the final line of your whole response MUST be exactly `LANE: ` followed by one of `tiny`, `normal`, or `high-risk`, and nothing more:
+
+- NO markdown on it: not `**LANE: normal**`, not a heading, not a list item.
+- NO trailing punctuation, parenthetical, or rationale: not `LANE: high-risk.`, not `LANE: high-risk (auth)`.
+- NO blank line, code fence, or any prose after it. The `LANE:` line is the absolute last line of your response.
+
+If you have reasoning to add, put it ABOVE the `FLAGS:` line, never below `LANE:`.

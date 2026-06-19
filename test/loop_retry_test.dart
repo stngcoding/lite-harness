@@ -136,6 +136,7 @@ PromptLibrary _prompts() => PromptLibrary(
   verifier: PromptTemplate('verifier', 'v', const {}),
   prVerifier: PromptTemplate('pr-verifier', 'p', const {}),
   intake: PromptTemplate('intake', 'i', const {}),
+  fixer: PromptTemplate('fixer', 'fix {{FINDINGS}}', const {'FINDINGS'}),
 );
 
 Config _config({required int maxAttempts}) => Config(

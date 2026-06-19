@@ -189,10 +189,16 @@ class FakeClaude extends ClaudeRunner {
 
   final implemented = <int>[];
   var verifyCount = 0;
+  var fixCount = 0;
 
-  /// When false, the PR review emits `VERDICT: FAIL` so the loop keeps the PRD
-  /// as a single draft PR instead of splitting it into a stack.
+  /// The verdict the PR review emits once any [failFirstReviews] window has
+  /// elapsed. `false` → a standing `VERDICT: FAIL` that drives the PRD to draft.
   bool verifyPass = true;
+
+  /// The first N PR reviews emit `VERDICT: FAIL` regardless of [verifyPass];
+  /// review N+1 onward uses [verifyPass]. Drives the WS2 auto-fix loop: a few
+  /// failing rounds, then (optionally) a pass.
+  int failFirstReviews = 0;
 
   @override
   Future<ClaudeRun> implement({
@@ -200,22 +206,41 @@ class FakeClaude extends ClaudeRunner {
     required String prompt,
     String systemAppend = '',
   }) async {
-    implemented.add(int.parse(prompt.trim()));
+    // The implementer template renders to a bare issue number; the fixer renders
+    // to `fix <findings>`. Tell them apart so a fix round is not parsed as one.
+    final n = int.tryParse(prompt.trim());
+    if (n != null) {
+      implemented.add(n);
+    } else {
+      fixCount++;
+    }
     return const ClaudeRun(transcript: '', result: _okResult);
   }
 
   @override
   Future<ClaudeRun> verify(String prompt) async {
     verifyCount++;
+    final pass = verifyCount <= failFirstReviews ? false : verifyPass;
     return ClaudeRun(
-      transcript: verifyPass ? 'VERDICT: PASS' : 'VERDICT: FAIL',
+      transcript: pass ? 'VERDICT: PASS' : 'VERDICT: FAIL',
       result: _okResult,
     );
   }
 
+  var classifyCount = 0;
+
+  /// When false, intake emits no `LANE:` line, so the loop must retry the
+  /// classification once before defaulting the lane to normal.
+  bool classifyEmitsLane = true;
+
   @override
-  Future<ClaudeRun> classify(String prompt) async =>
-      const ClaudeRun(transcript: 'LANE: normal', result: _okResult);
+  Future<ClaudeRun> classify(String prompt) async {
+    classifyCount++;
+    return ClaudeRun(
+      transcript: classifyEmitsLane ? 'LANE: normal' : 'no lane here',
+      result: _okResult,
+    );
+  }
 }
 
 class FakeProc extends ProcessRunner {
@@ -231,6 +256,7 @@ PromptLibrary _prompts() => PromptLibrary(
   verifier: PromptTemplate('verifier', 'v', const {}),
   prVerifier: PromptTemplate('pr-verifier', 'p', const {}),
   intake: PromptTemplate('intake', 'i', const {}),
+  fixer: PromptTemplate('fixer', 'fix {{FINDINGS}}', const {'FINDINGS'}),
 );
 
 const _config = Config(
@@ -246,6 +272,7 @@ HarnessLoop _loop(
   FakeClaude claude,
   FakeGit git, {
   EventLog? events,
+  TraceStore? traces,
 }) => HarnessLoop(
   config: _config,
   gh: gh,
@@ -254,7 +281,7 @@ HarnessLoop _loop(
   proc: FakeProc(),
   prompts: _prompts(),
   events: events,
-  traces: _tempTraces(),
+  traces: traces ?? _tempTraces(),
 );
 
 void main() {
@@ -399,23 +426,40 @@ void main() {
       expect(gh.closedChunkPrs, contains(263));
     });
 
-    test(
-      'a red review demotes the PRD to draft, never opens a second PR',
-      () async {
-        final gh = FakeGh(threeSlices());
-        final claude = FakeClaude()..verifyPass = false;
-        final git = FakeGit(drift: true);
+    test('a standing red review exhausts the auto-fix rounds, then drafts the '
+        'one PR', () async {
+      final gh = FakeGh(threeSlices());
+      final claude = FakeClaude()..verifyPass = false;
+      final git = FakeGit(drift: true);
 
-        final code = await _loop(gh, claude, git).run();
+      final code = await _loop(gh, claude, git).run();
 
-        expect(code, 0);
-        expect(claude.verifyCount, 1);
-        expect(gh.prCount, 1);
-        expect(gh.prByBranch.keys, contains('263-prd'));
-        expect(gh.readyMarked, isEmpty);
-        expect(gh.draftMarked, ['pr-263-prd']);
-      },
-    );
+      expect(code, 0);
+      // Initial review + one re-review per fix round (maxReviewFixes = 3).
+      expect(claude.verifyCount, 1 + _config.maxReviewFixes);
+      expect(claude.fixCount, _config.maxReviewFixes);
+      // Still one PR, never a second; left as a draft for a human.
+      expect(gh.prCount, 1);
+      expect(gh.prByBranch.keys, contains('263-prd'));
+      expect(gh.readyMarked, isEmpty);
+      expect(gh.draftMarked, ['pr-263-prd']);
+    });
+
+    test('auto-fix recovers a failed review → the one PR goes ready', () async {
+      final gh = FakeGh(threeSlices());
+      // First review FAILs, the fixer runs once, the re-review PASSes.
+      final claude = FakeClaude()..failFirstReviews = 1;
+      final git = FakeGit(drift: true);
+
+      final code = await _loop(gh, claude, git).run();
+
+      expect(code, 0);
+      expect(claude.verifyCount, 2); // initial fail + one passing re-review
+      expect(claude.fixCount, 1); // exactly one fix round
+      expect(gh.prCount, 1);
+      expect(gh.readyMarked, ['pr-263-prd']);
+      expect(gh.draftMarked, isEmpty);
+    });
 
     test('a re-run reuses the existing canonical PR (idempotent)', () async {
       final gh = FakeGh(threeSlices());
@@ -444,6 +488,50 @@ void main() {
       expect(gh.prByBranch.keys, contains('263-prd'));
       expect(gh.prByBranch.keys, isNot(contains('263-chunk-1-of-2-prd')));
       expect(gh.prBody['263-prd'], contains('Closes #263'));
+    });
+  });
+
+  group('intake retry + classifyFail denoise (WS4)', () {
+    test('a null lane retries intake once; a passing slice logs no '
+        'classifyFail', () async {
+      final boxes = {
+        10: Box(10, 'solo', 'no parent here', {'ready-for-agent'}, true),
+      };
+      final gh = FakeGh(boxes);
+      // Intake emits no LANE line, forcing the one retry, then the lane defaults.
+      final claude = FakeClaude()..classifyEmitsLane = false;
+      final traces = _tempTraces();
+
+      await _loop(gh, claude, FakeGit(drift: true), traces: traces).run();
+
+      // First classify emitted no lane → retried exactly once.
+      expect(claude.classifyCount, 2);
+
+      final slice = traces.readAll().firstWhere((r) => r.issue == 10);
+      expect(slice.outcome, 'pass');
+      // No lane parsed even after the retry → defaulted to normal.
+      expect(slice.lane, RiskLane.normal);
+      // Denoise: a missing lane on a slice that still PASSed is not friction.
+      expect(slice.frictions, isNot(contains(FrictionKind.classifyFail)));
+    });
+
+    test('a lane on the first try means no retry', () async {
+      final boxes = {
+        10: Box(10, 'solo', 'no parent here', {'ready-for-agent'}, true),
+      };
+      final gh = FakeGh(boxes);
+      final claude = FakeClaude(); // classifyEmitsLane defaults to true
+      final traces = _tempTraces();
+
+      await _loop(gh, claude, FakeGit(drift: true), traces: traces).run();
+
+      expect(
+        claude.classifyCount,
+        1,
+        reason: 'lane parsed first try, no retry',
+      );
+      final slice = traces.readAll().firstWhere((r) => r.issue == 10);
+      expect(slice.frictions, isNot(contains(FrictionKind.classifyFail)));
     });
   });
 }

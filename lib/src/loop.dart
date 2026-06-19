@@ -597,17 +597,32 @@ class HarnessLoop {
     // PR reviewer's bar — it never blocks the loop, so an unparseable verdict
     // safely defaults to `normal`.
     _phase(HarnessPhase.classify, '#${issue.number}');
-    final classifyRun = await _runWithApiRetry(
+    Future<ClaudeRun> classify() => _runWithApiRetry(
       () => claude.classify(
         prompts.intake(issue: issue, prdContext: coherence.prdContext),
       ),
       'Classify #${issue.number}',
     );
+    var classifyRun = await classify();
     _prdCostUsd += classifyRun.result?.costUsd ?? 0;
     _abortIfFatal(classifyRun, 'Classify #${issue.number}');
-    final parsedLane = parseLane(classifyRun.transcript);
+    var parsedLane = parseLane(classifyRun.transcript);
+    if (parsedLane == null) {
+      // Intake emitted no bare LANE: line — retry once before defaulting, since
+      // a single dropped line is usually transient, not a real classification.
+      print(
+        ansi.dim('  Intake emitted no lane — retrying classification once.'),
+      );
+      classifyRun = await classify();
+      _prdCostUsd += classifyRun.result?.costUsd ?? 0;
+      _abortIfFatal(classifyRun, 'Classify #${issue.number}');
+      parsedLane = parseLane(classifyRun.transcript);
+    }
+    // A missing lane is only friction worth reporting when the slice does not
+    // pass anyway — defaulting to `normal` on a slice that then sails through
+    // gates is harmless noise. recordTrace adds classifyFail per outcome.
+    final laneMissing = parsedLane == null;
     final lane = parsedLane ?? RiskLane.normal;
-    if (parsedLane == null) frictions.add(FrictionKind.classifyFail);
     final prevLane = _prdLane[parent];
     if (prevLane == null || lane.index > prevLane.index) {
       _prdLane[parent] = lane;
@@ -633,19 +648,25 @@ class HarnessLoop {
 
     // Appends this slice's single trace at a terminal outcome. Captures
     // [analyzeOk]/[testOk]/[ctxDetail] by reference so the detail reflects the
-    // last gate and the last implement run's context headroom.
-    void recordTrace(String outcome, int attempts) => traces.append(
-      TraceRecord(
-        ts: DateTime.now().toIso8601String(),
-        issue: issue.number,
-        prd: prdRef,
-        lane: lane,
-        outcome: outcome,
-        attempts: attempts,
-        frictions: frictions.toList(),
-        detail: 'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}$ctxDetail',
-      ),
-    );
+    // last gate and the last implement run's context headroom. A missing lane
+    // only counts as friction on a non-pass outcome (denoise — see above).
+    void recordTrace(String outcome, int attempts) {
+      final hit = {...frictions};
+      if (laneMissing && outcome != 'pass') hit.add(FrictionKind.classifyFail);
+      traces.append(
+        TraceRecord(
+          ts: DateTime.now().toIso8601String(),
+          issue: issue.number,
+          prd: prdRef,
+          lane: lane,
+          outcome: outcome,
+          attempts: attempts,
+          frictions: hit.toList(),
+          detail:
+              'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}$ctxDetail',
+        ),
+      );
+    }
 
     for (var attempt = 1; attempt <= config.maxAttempts; attempt++) {
       if (attempt > 1) {
@@ -938,44 +959,114 @@ class HarnessLoop {
     // Mechanical gate: the whole suite once over the canonical (full PRD) tree —
     // a red base (pre-existing failures) keeps the PRD a draft for a human;
     // work is never discarded here, only the auto-ready signal is withheld.
-    final analyzeOk = await _gate(HarnessPhase.analyze, [
+    var analyzeOk = await _gate(HarnessPhase.analyze, [
       'flutter',
       'analyze',
     ], _analyzeLog);
-    final testOk = await _gate(HarnessPhase.test, [
-      'flutter',
-      'test',
-    ], _testLog);
+    var testOk = await _gate(HarnessPhase.test, ['flutter', 'test'], _testLog);
     _logGates(activeParent, null, analyzeOk: analyzeOk, testOk: testOk);
-    final suiteLine =
-        'Full suite: analyze=${analyzeOk ? 'pass' : 'fail'} '
-        'test=${testOk ? 'pass' : 'fail'}.';
 
     // One holistic review over the whole PRD diff (origin/<base>..HEAD on the
     // canonical branch). The reviewer reads the local commit range, so no PR
     // need exist yet, and a single review covers the whole PRD.
-    _phase(HarnessPhase.review, 'PR #$activeParent');
-    final review = await _runWithApiRetry(
-      () => claude.verify(
-        prompts.prVerifier(
-          activeParent,
-          title,
-          config.base,
-          repo: config.repo,
-          prRef: canonical,
-          lane: _prdLane[activeParent],
+    Future<ClaudeRun> runReview() async {
+      _phase(HarnessPhase.review, 'PR #$activeParent');
+      final r = await _runWithApiRetry(
+        () => claude.verify(
+          prompts.prVerifier(
+            activeParent,
+            title,
+            config.base,
+            repo: config.repo,
+            prRef: canonical,
+            lane: _prdLane[activeParent],
+          ),
         ),
-      ),
-      'PR review #$activeParent',
-    );
-    _prdCostUsd += review.result?.costUsd ?? 0;
-    _abortIfFatal(review, 'PR review #$activeParent');
-    final pass = hasPassVerdict(review.transcript);
+        'PR review #$activeParent',
+      );
+      _prdCostUsd += r.result?.costUsd ?? 0;
+      _abortIfFatal(r, 'PR review #$activeParent');
+      return r;
+    }
+
+    var review = await runReview();
+    var pass = hasPassVerdict(review.transcript);
     events.event(
       'PR_REVIEW',
       prd: activeParent,
       detail: pass ? 'pass' : 'fail',
     );
+
+    // Auto-fix loop: gates green but the reviewer FAILED → feed the blocking
+    // findings to a PRD-level fixer, commit, re-gate, re-review — up to
+    // config.maxReviewFixes rounds. Only when the gates are green: a red build
+    // is a human's problem, never something we keep auto-patching. A fixer that
+    // produces no drift has nothing more to offer, so we stop and let the
+    // standing verdict decide the PR.
+    for (
+      var round = 1;
+      !pass && analyzeOk && testOk && round <= config.maxReviewFixes;
+      round++
+    ) {
+      _phase(
+        HarnessPhase.implement,
+        'PRD #$activeParent review fix $round/${config.maxReviewFixes}',
+      );
+      events.event(
+        'REVIEW_FIX',
+        prd: activeParent,
+        detail: 'round=$round/${config.maxReviewFixes}',
+      );
+      print(
+        '  ${ansi.dim('↻ review fix $round/${config.maxReviewFixes} for '
+        'PRD #$activeParent — feeding the blocking findings back.')}',
+      );
+      final fix = await _runWithApiRetry(
+        () => claude.implement(
+          model: config.model,
+          prompt: prompts.fixer(
+            activeParent,
+            title,
+            config.base,
+            findings: reviewComment(review.transcript),
+          ),
+          systemAppend: rulesSystemPrompt,
+        ),
+        'Review fix #$activeParent',
+      );
+      _prdCostUsd += fix.result?.costUsd ?? 0;
+      _abortIfFatal(fix, 'Review fix #$activeParent');
+
+      if (!await git.hasDrift()) {
+        print(
+          '  ${ansi.dim('Review fix $round produced no changes — leaving the '
+          'standing verdict to decide.')}',
+        );
+        break;
+      }
+      _phase(HarnessPhase.commit, 'PRD #$activeParent fix $round');
+      await git.commitAll(
+        'fix(#$activeParent): address review findings (round $round)\n\n'
+        'Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>',
+      );
+      analyzeOk = await _gate(HarnessPhase.analyze, [
+        'flutter',
+        'analyze',
+      ], _analyzeLog);
+      testOk = await _gate(HarnessPhase.test, ['flutter', 'test'], _testLog);
+      _logGates(activeParent, null, analyzeOk: analyzeOk, testOk: testOk);
+      review = await runReview();
+      pass = hasPassVerdict(review.transcript);
+      events.event(
+        'PR_REVIEW',
+        prd: activeParent,
+        detail: pass ? 'pass' : 'fail',
+      );
+    }
+
+    final suiteLine =
+        'Full suite: analyze=${analyzeOk ? 'pass' : 'fail'} '
+        'test=${testOk ? 'pass' : 'fail'}.';
     final reviewSummary = review.result == null
         ? ''
         : '\n\n_Review: ${review.result!.summary}._';

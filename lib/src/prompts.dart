@@ -52,15 +52,18 @@ class PromptLibrary {
     required PromptTemplate verifier,
     required PromptTemplate prVerifier,
     required PromptTemplate intake,
+    required PromptTemplate fixer,
   }) : _implementer = implementer,
        _verifier = verifier,
        _prVerifier = prVerifier,
-       _intake = intake;
+       _intake = intake,
+       _fixer = fixer;
 
   final PromptTemplate _implementer;
   final PromptTemplate _verifier;
   final PromptTemplate _prVerifier;
   final PromptTemplate _intake;
+  final PromptTemplate _fixer;
 
   static const _implementerVars = {
     'PRD_CONTEXT',
@@ -96,6 +99,12 @@ class PromptLibrary {
     'LABELS',
     'ISSUE_BODY',
   };
+  static const _fixerVars = {
+    'PARENT_NUMBER',
+    'PARENT_TITLE',
+    'BASE',
+    'FINDINGS',
+  };
 
   static Future<PromptLibrary> load({Directory? repoRoot}) async {
     final root = repoRoot ?? Directory.current;
@@ -104,6 +113,7 @@ class PromptLibrary {
       verifier: await _resolve('verifier', root, _verifierVars),
       prVerifier: await _resolve('pr-verifier', root, _prVerifierVars),
       intake: await _resolve('intake', root, _intakeVars),
+      fixer: await _resolve('fixer', root, _fixerVars),
     );
   }
 
@@ -224,6 +234,18 @@ class PromptLibrary {
             'verify every contract, auth, and migration claim against the '
             'actual diff, and do NOT PASS on an unverified contract claim — '
             'treat an unproven behavior change as a blocking gap, not a note.';
+
+  String fixer(
+    int parent,
+    String title,
+    String base, {
+    required String findings,
+  }) => _fixer.render({
+    'PARENT_NUMBER': '$parent',
+    'PARENT_TITLE': title,
+    'BASE': base,
+    'FINDINGS': findings.isEmpty ? '(no findings captured)' : findings,
+  });
 
   String intake({required Issue issue, String prdContext = ''}) {
     final labels = issue.labels.join(', ');
