@@ -113,6 +113,60 @@ void main() {
     });
   });
 
+  group('prSkipExplanation', () {
+    test('nothing-to-ship (no commits, no open subs) flags a human', () {
+      final out = prSkipExplanation(
+        prd: 367,
+        ahead: 0,
+        base: 'main',
+        branch: '367-feed',
+        openSubs: const [],
+      );
+      expect(out.needsHuman, isTrue);
+      expect(out.text, contains('PRD #367'));
+      expect(out.text, contains('nothing to ship'));
+      expect(out.text, contains('ralph-fail/<n>'));
+      expect(out.text, contains('relabel `ready-for-agent`'));
+    });
+
+    test('open subs all ready-for-agent are mid-retry, not a human stall', () {
+      final out = prSkipExplanation(
+        prd: 5,
+        ahead: 2,
+        base: 'dev',
+        branch: '5-x',
+        openSubs: const [
+          (number: 6, needsHuman: false),
+          (number: 7, needsHuman: false),
+        ],
+      );
+      expect(out.needsHuman, isFalse);
+      expect(out.text, contains('2 sub-issue(s) still open'));
+      expect(out.text, contains('#6, #7'));
+      expect(out.text, contains('ready-for-agent'));
+      expect(out.text, contains('retried automatically'));
+      expect(out.text, isNot(contains('needs you')));
+    });
+
+    test('a ready-for-human sub flags a human and is listed apart', () {
+      final out = prSkipExplanation(
+        prd: 5,
+        ahead: 1,
+        base: 'dev',
+        branch: '5-x',
+        openSubs: const [
+          (number: 6, needsHuman: false),
+          (number: 8, needsHuman: true),
+        ],
+      );
+      expect(out.needsHuman, isTrue);
+      expect(out.text, contains('#6 still `ready-for-agent`'));
+      expect(out.text, contains('#8 `ready-for-human`'));
+      expect(out.text, contains('needs you'));
+      expect(out.text, contains('Branch `5-x` holds 1 commit(s)'));
+    });
+  });
+
   group('conflict comments', () {
     test('mergeConflictComment names the slice and its blocker', () {
       final out = mergeConflictComment(12, 9);
@@ -125,6 +179,14 @@ void main() {
       expect(out, contains('PRD #3'));
       expect(out, contains('slice #5'));
       expect(out, contains('.dartralph/worktrees/'));
+    });
+
+    test('restackCloseComment names the PRD and the re-stacked slice', () {
+      final out = restackCloseComment(3, 5);
+      expect(out, contains('PRD #3'));
+      expect(out, contains('#5'));
+      expect(out, contains('re-implemented'));
+      expect(out, contains('analyze + scoped tests green'));
     });
   });
 }

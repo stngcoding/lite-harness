@@ -1,86 +1,66 @@
 part of 'loop.dart';
 
-/// How a slice narration line is toned in sequential mode. Parallel mode logs
-/// plain text to a per-issue file, so it ignores the tone. Purely presentational.
+/// Tone of a sequential-mode narration line; ignored by parallel's file log.
 enum _Tone { info, good, bad, dim }
 
-/// The coarse stage a slice is in, surfaced as a stdout phase marker (sequential)
-/// or a dashboard status (parallel). The `analyze` stage's marker is printed by
-/// [HarnessLoop._gate] itself in sequential mode, so the sequential drive treats
-/// it as a no-op to avoid a double marker.
+/// The coarse stage a slice is in (stdout phase marker, or dashboard status).
 enum _SliceStage { classify, implement, commit, analyze }
 
-/// The per-mode seam [HarnessLoop._runSlice] drives through. Everything the slice
-/// lifecycle does that differs between the sequential drive ([HarnessLoop._processSub])
-/// and a parallel worker ([HarnessLoop._driveWorker]) lives behind this interface:
-/// which git/claude binding to use, how a `claude` call is retried and costed,
-/// where narration goes, and what a terminal pass/fail means. The lifecycle logic
-/// itself is shared and lives in exactly one place.
+/// The per-mode seam [HarnessLoop._runSlice] drives through: everything that
+/// differs between the sequential drive ([HarnessLoop._processSub]) and a
+/// parallel worker ([HarnessLoop._driveWorker]) — git/claude binding, the
+/// `claude`-call policy, where narration goes, what pass/fail means — lives
+/// behind this interface so the lifecycle logic stays in one place.
 abstract class _SliceIo {
   /// The PRD parent number (equals the slice number for a PRD-of-one).
   int get prd;
 
-  /// The PRD parent for event/trace tagging, or null when the slice is its own
-  /// PRD (so events read `prd=null`).
+  /// The PRD parent for event/trace tagging, or null for a PRD-of-one.
   int? get prdRef;
 
-  /// The git binding for this slice — the process cwd (sequential) or the
-  /// slice's own worktree (parallel).
   GitOps get git;
 
-  /// The `claude` binding for this slice (worktree-scoped in parallel mode).
   ClaudeRunner get claude;
 
-  /// The working directory [HarnessLoop._gate]/[HarnessLoop._scopedTestGate] run
-  /// in: null in sequential mode (the process cwd) or the slice's own worktree
-  /// path in parallel mode.
+  /// Where the gates run: null (process cwd) or the slice's worktree path.
   String? get workingDirectory;
 
-  /// Runs a `claude` call with this mode's policy: sequential retries a transient
-  /// API error then aborts on a fatal; parallel additionally pauses the pool on a
-  /// rate limit. Both fold in the run's cost.
+  /// Runs a `claude` call under this mode's retry/cost policy (parallel also
+  /// pauses the pool on a rate limit).
   Future<ClaudeRun> call(Future<ClaudeRun> Function() fn, String context);
 
-  /// Marks the slice's current coarse [stage] (phase marker vs. dashboard).
   void stage(_SliceStage stage, [String? detail]);
 
-  /// Emits one narration line. [tone] applies only in sequential mode.
   void say(String line, {_Tone tone});
 
-  /// Outputs an already-formatted gate line verbatim — to stdout in sequential
-  /// mode, to the worker's per-issue log in parallel. Unlike [say] it adds no
-  /// prefix or tone, so the partial colouring the gates build survives intact.
+  /// Outputs an already-formatted gate line verbatim — no prefix or tone, so the
+  /// gates' partial colouring survives.
   void emit(String line);
 
-  /// Prints the analyze/test gate's stdout phase marker in sequential mode; a
-  /// no-op in parallel, where the dashboard owns the console.
+  /// Prints the gate's phase marker (sequential); no-op in parallel.
   void gatePhase(HarnessPhase phase);
 
-  /// The issue header banner, printed once in sequential mode; a no-op in
-  /// parallel mode (the dashboard owns the console).
+  /// Prints the issue banner (sequential); no-op in parallel.
   void banner(Issue issue);
 
-  /// Records the last implement run's context headroom (drives the dashboard in
-  /// parallel mode; ignored in sequential).
+  /// Records the last implement run's context headroom for the dashboard.
   void onFreePct(double? freePct);
 
-  /// Terminal pass: sequential closes the issue now; parallel records an outcome
-  /// (capturing its own commit sha) the merge phase integrates and closes later.
-  /// Returns true.
+  /// Terminal pass: sequential closes the issue; parallel records an outcome the
+  /// merge phase integrates and closes later. Returns true.
   Future<bool> pass({
     required Issue issue,
     required bool noChanges,
     required String implementSummary,
   });
 
-  /// Terminal fail, called after the shared tag/reset/relabel/comment rollback
-  /// already ran in the lifecycle: sequential just returns false; parallel
-  /// additionally records a failed outcome. Returns false.
+  /// Terminal fail, after the shared rollback already ran. Parallel also records
+  /// a failed outcome. Returns false.
   bool fail();
 }
 
-/// Sequential drive: git/claude are the process-cwd bindings, narration goes to
-/// stdout with ansi tone, and a pass closes the issue immediately.
+/// Sequential drive: process-cwd git/claude, narration to stdout, a pass closes
+/// the issue immediately.
 class _SeqSliceIo implements _SliceIo {
   _SeqSliceIo(this._loop, {required this.prd, required this.prdRef});
 
@@ -118,7 +98,7 @@ class _SeqSliceIo implements _SliceIo {
       case _SliceStage.commit:
         _loop._phase(HarnessPhase.commit, detail);
       case _SliceStage.analyze:
-        break; // _gate prints the analyze/test phase marker itself.
+        break;
     }
   }
 
@@ -193,9 +173,8 @@ class _SeqSliceIo implements _SliceIo {
   bool fail() => false;
 }
 
-/// Parallel drive: git/claude are worktree-scoped, narration goes to the worker's
-/// per-issue log, and a pass is recorded for the merge phase rather than closing
-/// the issue now (its commit must first land on the PRD branch).
+/// Parallel drive: worktree-scoped git/claude, narration to the worker's log,
+/// a pass recorded for the merge phase instead of closing the issue now.
 class _WorkerSliceIo implements _SliceIo {
   _WorkerSliceIo(this._loop, this._w, {required this.prdRef});
 
@@ -262,7 +241,6 @@ class _WorkerSliceIo implements _SliceIo {
           : 'Verified by AFK loop (parallel) on `${_w.branch}`: '
                 'analyze + scoped tests green.$implementSummary',
     );
-    _w.passed = true;
     say(
       noChanges
           ? '✓ already done (no changes) → will close at integration.'
@@ -278,6 +256,41 @@ class _WorkerSliceIo implements _SliceIo {
   }
 }
 
+/// The merge-phase re-stack drive ([HarnessLoop._restackSlice]). Like the
+/// sequential drive (cwd git/claude, stdout) but cost folds into the PRD
+/// accumulator and a pass does *not* close the issue — [HarnessLoop._mergeAndPrAll]
+/// closes every slice once the PRD is assembled.
+class _RestackSliceIo extends _SeqSliceIo {
+  _RestackSliceIo(super.loop, {required super.prd, required super.prdRef});
+
+  @override
+  Future<ClaudeRun> call(
+    Future<ClaudeRun> Function() fn,
+    String context,
+  ) async {
+    final run = await _loop._runWithApiRetry(fn, context);
+    _loop._addCost(prd, run);
+    _loop._abortIfFatal(run, context);
+    return run;
+  }
+
+  @override
+  Future<bool> pass({
+    required Issue issue,
+    required bool noChanges,
+    required String implementSummary,
+  }) async {
+    say(
+      noChanges
+          ? '✓ #${issue.number} re-stacked clean — the assembled branch already '
+                'satisfies it.'
+          : '✓ #${issue.number} re-stacked onto the assembled PRD branch.',
+      tone: _Tone.good,
+    );
+    return true;
+  }
+}
+
 extension _SliceLifecycle on HarnessLoop {
   Future<bool> _processSub(Issue issue) async {
     _handled.add(issue.number);
@@ -290,12 +303,9 @@ extension _SliceLifecycle on HarnessLoop {
   /// The slice lifecycle shared by both drives: classify the risk lane, then up
   /// to [Config.maxAttempts] rounds of implement → commit (secret-scanned) →
   /// analyze + scoped test, rolling back and feeding the failing logs forward on
-  /// each miss; a terminal pass closes/integrates the issue, a terminal fail tags
-  /// and hands it to a human. Every difference between the sequential drive and a
-  /// parallel worker — the git/claude binding, the API-call policy, where
-  /// narration goes, and what a pass/fail does — is behind [io] ([_SeqSliceIo] /
-  /// [_WorkerSliceIo]), so this method is the single source of truth. Returns
-  /// whether the slice passed.
+  /// each miss. A terminal pass closes/integrates the issue; a terminal fail tags
+  /// and hands it to a human. All mode differences are behind [io], so this is
+  /// the single source of truth. Returns whether the slice passed.
   Future<bool> _runSlice(Issue issue, _SliceIo io) async {
     final analyzeLog = _analyzeLogFor(issue.number);
     final testLog = _testLogFor(issue.number);
@@ -304,15 +314,12 @@ extension _SliceLifecycle on HarnessLoop {
     final coherence = await _coherenceContext(prdRef, issue.number);
     io.banner(issue);
 
-    // Friction this slice hits, deduped (a Set): one TraceRecord is appended
-    // per terminal outcome, so a gate that fails on every attempt counts once.
+    // Deduped so a gate that fails every attempt counts as friction once.
     final frictions = <FrictionKind>{};
 
-    // Classify the slice's risk lane before implementing. An isolated intake
-    // agent (its own system prompt) reads the issue + PRD context and emits a
-    // bare `LANE:` line. The lane only tunes the implementer guidance and the
-    // PR reviewer's bar — it never blocks the loop, so an unparseable verdict
-    // safely defaults to `normal`.
+    // Classify the risk lane: an isolated intake agent emits a bare `LANE:`
+    // line. The lane only tunes guidance and the review bar, so an unparseable
+    // verdict safely defaults to `normal`.
     io.stage(_SliceStage.classify, '#${issue.number}');
     Future<ClaudeRun> classify() async {
       final run = await io.call(
@@ -328,8 +335,8 @@ extension _SliceLifecycle on HarnessLoop {
     var classifyRun = await classify();
     var parsedLane = parseLane(classifyRun.transcript);
     if (parsedLane == null) {
-      // Intake emitted no bare LANE: line — retry once before defaulting, since
-      // a single dropped line is usually transient, not a real classification.
+      // A single dropped line is usually transient — retry once before
+      // defaulting.
       io.say(
         'Intake emitted no lane — retrying classification once.',
         tone: _Tone.dim,
@@ -337,9 +344,6 @@ extension _SliceLifecycle on HarnessLoop {
       classifyRun = await classify();
       parsedLane = parseLane(classifyRun.transcript);
     }
-    // A missing lane is only friction worth reporting when the slice does not
-    // pass anyway — defaulting to `normal` on a slice that then sails through
-    // gates is harmless noise. recordTrace adds classifyFail per outcome.
     final laneMissing = parsedLane == null;
     final lane = parsedLane ?? RiskLane.normal;
     final prevLane = _prdLane[io.prd];
@@ -354,35 +358,23 @@ extension _SliceLifecycle on HarnessLoop {
 
     final baseline = await io.git.head();
 
-    // One sub-issue gets up to `config.maxAttempts` shots: implement → commit
-    // → gate. A failing attempt is rolled back to [baseline] and the agent is
-    // re-run with the failing analyze/test logs fed back via `{{RETRY}}`, so it
-    // fixes forward instead of repeating the same mistake. Only after every
-    // attempt fails does the issue get tagged and handed to a human.
     var analyzeOk = false;
     var testOk = false;
     var implementSummary = '';
     var ctxDetail = '';
     var retry = '';
-
-    // The model the last implement attempt ran on — recorded in the trace so the
-    // lane→model tiering (and any retry escalation) is visible in the log.
     var lastModel = '';
 
-    // Whether the last implement run finished low on context headroom (<15%
-    // free), so a slice that then failed can be flagged as likely too big.
+    // The last implement run ended below 15% free context — a failed slice that
+    // ran this low is likely too big to land in one pass.
     var contextStarved = false;
 
-    // The repo's recurring error signatures, fed to the implementer on its first
-    // attempt only (a retry already carries the specific failing logs). Advisory.
+    // Recurring error signatures, fed to the implementer's first attempt only
+    // (a retry already carries the specific failing logs).
     final pitfalls = recurringSignatures(traces.readAll());
 
-    // Appends this slice's single trace at a terminal outcome. Captures
-    // [analyzeOk]/[testOk]/[ctxDetail] by reference so the detail reflects the
-    // last gate and the last implement run's context headroom. A missing lane
-    // only counts as friction on a non-pass outcome (denoise — see above).
-    // [signature] is the one-line gate error this outcome left behind (null on a
-    // pass) — what [recurringSignatures] later aggregates into the digest above.
+    // Appends this slice's one trace at a terminal outcome, capturing the gate
+    // state by reference. [signature] is the one-line gate error (null on pass).
     void recordTrace(String outcome, int attempts, {String? signature}) {
       final hit = {...frictions};
       if (laneMissing && outcome != 'pass') hit.add(FrictionKind.classifyFail);
@@ -413,9 +405,8 @@ extension _SliceLifecycle on HarnessLoop {
         await io.git.resetHard(baseline);
       }
 
-      // Start the slice on its risk lane's floor model and climb one rung toward
-      // the run's ceiling (`config.model`) on each retry, so a cheap model takes
-      // the first shot and a smarter one is only paid for when a gate fails.
+      // Open on the lane's floor model and climb one rung toward the ceiling
+      // (`config.model`) per retry, so a smarter model is paid for only on a miss.
       final model = modelForAttempt(lane, attempt, ceiling: config.model);
       lastModel = model;
       io.stage(
@@ -463,9 +454,8 @@ extension _SliceLifecycle on HarnessLoop {
       ctxDetail = freePct == null ? '' : ' ctx=${freePct.round()}%free';
 
       if (!await io.git.hasDrift()) {
-        // No uncommitted changes — current state may already satisfy the issue
-        // (e.g. a prior human commit resolved it), or the agent simply produced
-        // nothing this attempt. Gate it: green means done; otherwise retry.
+        // No changes: base may already satisfy the issue. Gate it — green means
+        // done, otherwise retry.
         io.stage(_SliceStage.analyze);
         analyzeOk = await _gate(
           HarnessPhase.analyze,
@@ -476,6 +466,9 @@ extension _SliceLifecycle on HarnessLoop {
         testOk = await _scopedTestGate(baseline, issue.number, testLog, io);
         _logGates(prdRef, issue.number, analyzeOk: analyzeOk, testOk: testOk);
         if (analyzeOk && testOk) {
+          // No commit → empty scope, recorded so the parallel scheduler reads a
+          // known-empty scope rather than re-predicting it as "unknown".
+          _sliceScope[issue.number] = const {};
           recordTrace('pass', attempt);
           return io.pass(
             issue: issue,
@@ -554,6 +547,11 @@ extension _SliceLifecycle on HarnessLoop {
       _logGates(prdRef, issue.number, analyzeOk: analyzeOk, testOk: testOk);
 
       if (analyzeOk && testOk) {
+        // Capture the exact changed-file set so the scheduler can serialise — and
+        // stack — any later sibling that overlaps it.
+        _sliceScope[issue.number] = (await io.git.changedFiles(
+          baseline,
+        )).toSet();
         recordTrace('pass', attempt);
         return io.pass(
           issue: issue,

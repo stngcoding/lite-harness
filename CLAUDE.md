@@ -197,22 +197,44 @@ When `--concurrency` is 2..4, `run()` forks into `_drainParallel` instead — a
   a merge conflict is a real integration clash → relabel `ready-for-human`, skip.
   `GitOps` carries a `workingDirectory`, so each worker's `git`/`claude`/`fvm`
   gates are scoped to its worktree. Per-issue output streams to
-  `.dartralph/logs/issue-<n>.log`, not stdout.
+  `.dartralph/logs/issue-<n>.log`, not stdout. `createWorktree` is **self-healing**:
+  a run that was killed (e.g. by a hard limit-out) leaves a stale `ralph-slice/<n>`
+  branch + directory, so a plain `worktree add -b` would fail; on a first failure it
+  clears the stale worktree/branch/orphan-dir for that exact path and retries once,
+  so a crashed run never strands the slice on the next pass.
 - **`_driveWorker` shares the slice lifecycle with `_processSub`.** Both call the
   single `_runSlice` (classify → implement → secret-scan → commit → analyze +
   scoped test); the worker passes a `_WorkerSliceIo`, so a terminal pass records
   a `_WorkerOutcome` for the merge phase instead of closing the issue and opening
   a PR inline. N=1 stays untouched because it passes `_SeqSliceIo` to the very
   same method — no second copy to drift.
-- **Rate-limit is recoverable here.** A `claude` rate limit pauses the *scheduler*
-  (`_rateLimitPausedUntil`) — in-flight workers ride their own retry backoff —
-  rather than aborting; only auth/billing/exhausted-transient throws `ClaudeAbort`
-  and drains the pool (`_callPausing`).
+- **A usage limit checkpoints, it does not pause.** A `claude` rate limit
+  (`_callPausing`) throws a *resumable* `ClaudeAbort`. The scheduler stops handing
+  out work and lets in-flight workers finish (each on its own retry backoff), then
+  `_checkpointAndCleanup` runs *before* the abort unwinds: every PRD with passed
+  slices is cherry-picked onto its `<parent>-<slug>` branch and **pushed**, those
+  issues are closed, and every leftover worktree (a slice that failed or was
+  interrupted mid-flight) is dropped — its issue left `ready-for-agent` to retry.
+  The PR is *not* opened here (its `diff-verifier` + full suite would re-hit the
+  same limit); it opens on the next run once the PRD drains. The process then
+  exits **75** (EX_TEMPFAIL) so a wrapper (cron/launchd/`/loop`) re-runs when the
+  window resets and the idempotent harness resumes. Pausing a live pool for a cap
+  that can be hours out was fragile — a killed process orphaned worktrees, and the
+  next run's `git worktree add` then failed every slice into `ready-for-human`.
+  Auth/billing/exhausted-transient still throw a *non*-resumable `ClaudeAbort`
+  (exit 2): completed work is checkpointed the same way, but a re-run would fail
+  identically, so it does not signal retry-me.
 - **Merge phase (`_mergeAndPrAll`).** After the pool drains, each PRD's passed
   slices are cherry-picked in issue order onto its `<parent>-<slug>` branch, then
   the unchanged PR gate (`_maybeOpenPr`: full suite + `diff-verifier` + the CI
-  watch of step 5) runs. A cherry-pick conflict ships a draft `[NEEDS HUMAN]`
-  PR; nothing is rolled back.
+  watch of step 5) runs. A cherry-pick conflict — a slice that forked off a base
+  missing a sibling's overlapping edit (an overlap the implicit-blocker predictor
+  did not catch) — first gets the **re-stack backstop** (`_restackSlice`): the
+  slice is re-implemented *on the already-assembled branch* via the shared
+  `_runSlice` (behind a `_RestackSliceIo`) and re-gated; a green re-run leaves the
+  correctly-based commit on the branch and assembly continues. Only a *failed*
+  re-stack is a true integration clash → a draft `[NEEDS HUMAN]` PR. Nothing is
+  ever rolled back past the slice's own pre-attempt tip.
 - **Dashboard.** When stdout is a tty, a 1s `Timer` re-renders one status line per
   in-flight slice (cursor-up overwrite); workers log to files so it never tears.
 

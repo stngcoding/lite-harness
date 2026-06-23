@@ -67,6 +67,34 @@ void main() {
     test('ignores references outside the Parent section', () {
       expect(parentOf('## Parent\n#12\n\n## Notes\n#99\n', 10), 12);
     });
+
+    test('reads the inline bold label form (**Parent:** #366)', () {
+      expect(parentOf('**Parent:** #366', 367), 366);
+    });
+
+    test('reads the plain inline label form (Parent: #366)', () {
+      expect(parentOf('Parent: #366\n', 367), 366);
+    });
+
+    test('reads an inline label that leads with a list marker', () {
+      expect(parentOf('- _Parent_: #366', 367), 366);
+    });
+
+    test('reads an inline label embedded in a larger body', () {
+      const body =
+          '## Summary\nDo the thing.\n\n**Parent:** #366\n\n## Notes\nsee #99\n';
+      expect(parentOf(body, 367), 366);
+    });
+
+    test('the heading form still wins over an unrelated inline mention', () {
+      // A real `## Parent` block is authoritative even if a stray inline
+      // "parent:" line appears elsewhere in the body.
+      expect(parentOf('## Parent\n#12\n\nParent: #99\n', 10), 12);
+    });
+
+    test('a body with no parent at all still self-parents', () {
+      expect(parentOf('The parent component lives in #5.', 10), 10);
+    });
   });
 
   group('blockersOf', () {
@@ -89,6 +117,21 @@ void main() {
       );
       expect(
         blockersOf('## Blocked by\nNone - spine for #337/#338/#339.\n'),
+        isEmpty,
+      );
+    });
+
+    test('reads the inline bold label form (**Blocked by:** #264)', () {
+      expect(blockersOf('**Blocked by:** #264'), [264]);
+    });
+
+    test('reads several blockers from one inline label line', () {
+      expect(blockersOf('Blocked by: #264, #265\n'), [264, 265]);
+    });
+
+    test('the inline "None" form still suppresses incidental references', () {
+      expect(
+        blockersOf('**Blocked by:** None — see #338 for context.'),
         isEmpty,
       );
     });
@@ -122,6 +165,18 @@ void main() {
         issue(3, '## Parent\n#100\n'),
       ]);
       expect(umbrellas, {100, 200});
+    });
+
+    test('groups slices that declare their parent with an inline bold label', () {
+      // The #366/#367 production case: slices used `**Parent:** #366`, which the
+      // heading-only parser missed — so #366 never registered as an umbrella and
+      // its slices detached into self-parenting PRDs-of-one.
+      final umbrellas = umbrellaNumbers([
+        issue(366, 'PRD spec, no Parent section'),
+        issue(367, '**Parent:** #366'),
+        issue(368, '**Parent:** #366\n\n**Blocked by:** #367'),
+      ]);
+      expect(umbrellas, {366});
     });
   });
 
@@ -176,6 +231,34 @@ void main() {
       expect(
         eligibleSlices(ready, satisfied: {}, excluded: {}).map((i) => i.number),
         [20, 10, 30],
+      );
+    });
+
+    test('an unsatisfied implicit overlap blocker holds a slice back', () {
+      final ready = [issue(10, 'no blockers'), issue(11, 'no blockers')];
+      // #11 implicitly overlaps #10 (same files, no declared blocker). Until
+      // #10 is satisfied, #11 must wait so the two never fork off the same base.
+      final implicit = {
+        11: {10},
+      };
+      expect(
+        eligibleSlices(
+          ready,
+          satisfied: {},
+          excluded: {},
+          implicit: implicit,
+        ).map((i) => i.number),
+        [10],
+      );
+      // Once #10 passes, #11 unblocks and will stack on it.
+      expect(
+        eligibleSlices(
+          ready,
+          satisfied: {10},
+          excluded: {},
+          implicit: implicit,
+        ).map((i) => i.number),
+        [10, 11],
       );
     });
   });

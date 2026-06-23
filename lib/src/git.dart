@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'proc.dart';
 
 class GitOps {
@@ -5,9 +7,8 @@ class GitOps {
 
   final ProcessRunner _proc;
 
-  /// The repo this instance operates in. `null` = the harness process's own cwd
-  /// (the canonical worktree); a parallel worker passes its per-issue worktree
-  /// path so its git commands act on that tree, not the shared one.
+  /// The repo this instance operates in. `null` = the process cwd; a parallel
+  /// worker passes its per-issue worktree path so its git acts on that tree.
   final String? workingDirectory;
 
   Future<String> _out(List<String> arguments) async => (await _proc.run(
@@ -22,13 +23,10 @@ class GitOps {
     workingDirectory: workingDirectory,
   )).ok;
 
-  /// Tooling artifacts rewritten by hooks while the loop runs; they must
-  /// never ride along in issue commits or count as implementation drift. The
-  /// bundled review agents the harness drops into the target repo are here too
-  /// (mirrors `AgentInstaller.bundledAgents`): they are harness scaffolding,
-  /// not part of any issue's slice. `.dartralph/traces.jsonl` (cross-run
-  /// friction) and `.dartralph/calls.jsonl` (the per-call cost ledger) are
-  /// harness state, never a slice artifact.
+  /// Harness scaffolding that must never ride along in an issue commit or count
+  /// as drift: hook-rewritten artifacts, the bundled review agents the harness
+  /// drops in (mirrors `AgentInstaller.bundledAgents`), and the `.dartralph/`
+  /// state (traces, cost ledger, worktrees, logs).
   static const artifactExcludes = [
     '.remember',
     '.claude/agents/diff-verifier.md',
@@ -104,10 +102,8 @@ class GitOps {
         .toList();
   }
 
-  /// The full patch text of the slice's commit range ([baseline]..HEAD) — fed
-  /// back to the implementer on a retry so it sees what its previous attempt
-  /// actually changed instead of re-deriving blind. Artifacts are already
-  /// excluded by [commitAll], so the committed range carries none.
+  /// The full patch of the slice's commit range ([baseline]..HEAD) — fed back to
+  /// the implementer on a retry so it sees what its last attempt changed.
   Future<String> diff(String baseline) => _out(['diff', baseline, 'HEAD']);
 
   /// The `--stat` summary (files + ±counts) of [baseline]..HEAD — the bounded
@@ -122,9 +118,8 @@ class GitOps {
     return commitStaged(message);
   }
 
-  /// Stages every changed work-path (artifacts excluded) without committing —
-  /// the seam the secret-scan inspects via [stagedDiff] before the commit is
-  /// allowed to land.
+  /// Stages every changed work-path (artifacts excluded) without committing, so
+  /// the secret-scan can inspect [stagedDiff] before [commitStaged] lands.
   Future<void> stageAll() async {
     await _proc.run('git', [
       'add',
@@ -143,18 +138,27 @@ class GitOps {
 
   /// Adds a linked worktree at `.dartralph/worktrees/<branch>` on a fresh
   /// [branch] cut from [fromRef], so a parallel worker edits an isolated tree.
-  /// Returns the path, or null if the worktree could not be created.
+  /// Returns the path, or null if it could not be created. Self-healing: a
+  /// crashed run leaves a stale branch + directory that fails `worktree add -b`,
+  /// so on a first failure we clear the stale state for this path and retry once.
   Future<String?> createWorktree(String branch, String fromRef) async {
     final path = '.dartralph/worktrees/$branch';
-    final ok = await _succeeds([
-      'worktree',
-      'add',
-      '-b',
-      branch,
-      path,
-      fromRef,
-    ]);
-    return ok ? path : null;
+    if (await _addWorktree(branch, path, fromRef)) return path;
+    await removeWorktree(path);
+    await deleteBranch(branch);
+    _deleteDir(path);
+    return await _addWorktree(branch, path, fromRef) ? path : null;
+  }
+
+  Future<bool> _addWorktree(String branch, String path, String fromRef) =>
+      _succeeds(['worktree', 'add', '-b', branch, path, fromRef]);
+
+  /// Removes a stale orphan directory `git worktree` no longer tracks. Resolved
+  /// against the same [workingDirectory] git runs in, so relative paths line up.
+  void _deleteDir(String path) {
+    final full = workingDirectory == null ? path : '$workingDirectory/$path';
+    final dir = Directory(full);
+    if (dir.existsSync()) dir.deleteSync(recursive: true);
   }
 
   Future<void> removeWorktree(String path) async {

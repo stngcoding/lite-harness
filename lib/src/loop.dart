@@ -18,6 +18,7 @@ import 'proc.dart';
 import 'prompts.dart';
 import 'retry_feedback.dart';
 import 'secret_scan.dart';
+import 'slice_scope.dart';
 import 'test_scope.dart';
 import 'trace.dart';
 import 'verdict.dart';
@@ -26,11 +27,8 @@ part 'ci_watcher.dart';
 part 'slice_runner.dart';
 part 'worker_pool.dart';
 
-/// Per-issue gate log paths. Keyed by issue/PRD number so two slices gating
-/// concurrently (parallel pool) never clobber each other's log — and so a
-/// cross-suite parallel `dart test` no longer reads a half-written shared file
-/// (the historical flaky source). Sequential runs key by the same number, so
-/// behavior is unchanged at N=1.
+/// Per-issue gate log paths, keyed by number so concurrent slices never clobber
+/// a shared file.
 String _analyzeLogFor(int number) => '/tmp/ralph-$number-analyze.log';
 String _testLogFor(int number) => '/tmp/ralph-$number-test.log';
 
@@ -64,109 +62,91 @@ class HarnessLoop {
   final ProcessRunner proc;
   final PromptLibrary prompts;
 
-  /// Target-repo `.claude/rules/*.md`, flattened into one blob and injected into
-  /// the implementer's system prompt via `--append-system-prompt`. Loaded once
-  /// at startup; `''` when the target ships no root-level rules. See
-  /// `loadRulesSystemPrompt` (`rules.dart`).
+  /// Target-repo `.claude/rules/*.md` flattened into the implementer's
+  /// `--append-system-prompt`; `''` when the target ships none.
   final String rulesSystemPrompt;
 
   final EventLog events;
 
-  /// Cross-run friction log. Each terminal slice/PR outcome appends one
-  /// [TraceRecord]; [run] prints a [summarize] report at the end so repeated
-  /// friction across runs surfaces as advisory proposals.
+  /// Cross-run friction log; [run] prints a [summarize] report at the end.
   final TraceStore traces;
 
-  /// Durable per-call cost ledger. Every completed `claude` call appends one
-  /// [CallRecord] (phase, model, cost/turns/duration) via [_recordCall], so the
-  /// spend that the human transcript prints and forgets is recoverable for
-  /// later analysis. [_printCostReport] summarizes this run's calls at the end.
+  /// Durable per-call cost ledger ([_recordCall] appends, [_printCostReport]
+  /// summarizes this run).
   final CallLog calls;
 
-  /// This run's [CallRecord]s in order, mirrored in memory so [_printCostReport]
-  /// scopes to the current run without re-reading the cross-run [calls] file.
   final List<CallRecord> _runCalls = [];
 
   final Ansi ansi;
 
-  /// Highest (riskiest) lane seen among a PRD's slices, keyed by PRD parent
-  /// number. Feeds the PR reviewer's bar in [_maybeOpenPr]. A PRD takes the max
-  /// of its slices: one high-risk slice raises the whole PR's review bar.
+  /// Riskiest lane among a PRD's slices — one high-risk slice raises the whole
+  /// PR's review bar in [_maybeOpenPr].
   final Map<int, RiskLane> _prdLane = {};
 
-  /// Backoff between retries of a `claude` run that hit a *transient* API
-  /// failure (overload/5xx, dropped stream, exhausted internal retry). One entry
-  /// per retry, so the length is the retry cap. A hard failure (rate limit,
-  /// auth, billing) is never retried. Injectable so tests don't actually sleep.
+  /// Backoff per retry of a *transient* `claude` API failure; length is the
+  /// retry cap. Injectable so tests don't sleep.
   final List<Duration> apiRetryBackoff;
 
-  /// Running `claude` API spend (USD) for the PRD currently being drained,
-  /// summed from each slice's `result` event. Reset when a new PRD starts.
+  /// `claude` spend for the PRD being drained; reset when a new PRD starts.
   double _prdCostUsd = 0;
 
-  /// Issue numbers already consumed in this run (processed as a sub, or dropped
-  /// as an umbrella). GitHub's issue list is eventually consistent: right after
-  /// `closeIssue`/`relabelForHuman`/`dropAgentLabel`, the next `gh issue list`
-  /// can still return the just-handled issue (a stale read), which would make
-  /// the loop implement it a second time. This in-memory guard makes selection
-  /// independent of that read-after-write lag.
+  /// Issue numbers already consumed this run. GitHub's issue list lags a write,
+  /// so this guard keeps a just-handled issue from being picked up twice.
   final Set<int> _handled = {};
 
-  /// Parallel mode only (`concurrency > 1`). Issue numbers whose slice passed
-  /// its gates *this run*. A passed slice is not closed until the merge phase
-  /// (its commit must first land on the PRD branch), so its blocker dependents
-  /// cannot rely on GitHub state alone to know it is done — this set is the
-  /// in-run half of the DAG-readiness check in [_nextReady].
+  /// Parallel mode: issues whose slice passed this run. A pass is not closed
+  /// until the merge phase, so dependents read readiness from here, not GitHub.
   final Set<int> _passedThisRun = {};
 
-  /// Parallel mode only. Per-PRD `claude` spend, summed across that PRD's slices
-  /// run in their own worktrees. The sequential [_prdCostUsd] cannot be shared
-  /// across concurrent PRDs, so the pool accumulates here and copies the total
-  /// into [_prdCostUsd] just before each PRD's PR is opened.
+  /// Parallel mode: per-PRD `claude` spend across worktrees, copied into
+  /// [_prdCostUsd] before each PRD's PR opens.
   final Map<int, double> _prdCostAccum = {};
 
-  /// Parallel mode only. Each slice's terminal outcome, keyed by issue number —
-  /// what the merge phase ([_mergeAndPrAll]) cherry-picks onto each PRD branch.
+  /// Parallel mode: each slice's terminal outcome, cherry-picked onto its PRD
+  /// branch by [_mergeAndPrAll].
   final Map<int, _WorkerOutcome> _workerOutcomes = {};
 
-  /// Parallel mode only. Live worker registry for the dashboard.
+  /// Parallel mode: each passed slice's exact changed-file set, captured at
+  /// pass to sharpen `implicitBlockers` from prediction to ground truth.
+  final Map<int, Set<String>> _sliceScope = {};
+
+  /// Parallel mode: the file-overlap blockers [_nextReady] chose for each slice,
+  /// read by [_runIssueInWorktree] to pick its merge base. Never overwritten.
+  final Map<int, Set<int>> _implicitBlockers = {};
+
+  /// Parallel mode: live worker registry for the dashboard.
   final Map<int, _Worker> _workers = {};
 
-  /// Parallel mode only. When a `claude` run reports a rate limit, the scheduler
-  /// stops launching new slices until this instant; in-flight workers ride their
-  /// own [_runWithApiRetry] backoff. Null when not paused.
-  DateTime? _rateLimitPausedUntil;
-
-  /// Parallel mode only. Set when an in-flight worker hits an unrecoverable
-  /// condition (auth/billing/exhausted-transient). The scheduler stops launching
-  /// new work, lets in-flight workers drain, then rethrows so [run] aborts.
+  /// Parallel mode: set when an in-flight worker hits a pool-stopping condition
+  /// (usage limit → resumable, auth/billing → hard). The scheduler then drains,
+  /// [_checkpointAndCleanup]s, and [run] rethrows.
   ClaudeAbort? _hardAbort;
 
-  /// Parallel mode only. Drives the live worker dashboard; null when not running
-  /// or when stdout is not a terminal. [_dashboardLines] is the height of the
-  /// block last drawn, so the next render can move the cursor up to overwrite it.
+  /// Parallel-mode dashboard state; [_dashboardLines] is the last block height
+  /// so the next render can overwrite it. Null timer when stdout is not a tty.
   Timer? _dashboardTimer;
   int _dashboardLines = 0;
 
-  /// Prints the active-stage marker, e.g. `▶ IMPLEMENT — #123 fix login`.
   void _phase(HarnessPhase phase, [String? detail]) =>
       print(phase.marker(ansi, detail));
 
-  /// Aborts the whole loop when [run] hit an unrecoverable condition (rate
-  /// limit, auth/billing, streaming death) — every later `claude` call would
-  /// fail the same way, so there is no point grinding through the queue. A
-  /// per-task failure (max-turns, bad code) is not fatal and returns normally.
+  /// Aborts the whole loop on an unrecoverable `claude` condition — every later
+  /// call would fail the same way. A rate limit is resumable (checkpoint and
+  /// exit for a re-run); an exhausted-transient or auth/billing failure is hard.
   void _abortIfFatal(ClaudeRun run, String context) {
-    // A transient API failure that survived every retry is no longer
-    // recoverable, so it aborts here too — alongside the hard failures.
+    if (run.rateLimited != null) {
+      throw ClaudeAbort(
+        '$context — ${run.rateLimited!.summary}',
+        resumable: true,
+      );
+    }
     final fatal = run.fatalError ?? run.transientApiError;
     if (fatal != null) throw ClaudeAbort('$context — $fatal');
   }
 
-  /// Runs a `claude` call, retrying on a *transient* API failure (overload/5xx,
-  /// dropped stream, exhausted internal retry) with [apiRetryBackoff]. Returns
-  /// as soon as a run is clean or hard-fatal; a transient run that survives the
-  /// last retry is returned for the caller's [_abortIfFatal] to abort on.
+  /// Runs a `claude` call, retrying a *transient* API failure with
+  /// [apiRetryBackoff]. A transient run that survives the last retry is returned
+  /// for the caller's [_abortIfFatal] to abort on.
   Future<ClaudeRun> _runWithApiRetry(
     Future<ClaudeRun> Function() call,
     String context,
@@ -194,10 +174,8 @@ class HarnessLoop {
     return run;
   }
 
-  /// Aggregates the cross-run trace log into a [FrictionReport] and prints it at
-  /// the end of an AFK run. Advisory only: it surfaces repeated friction so a
-  /// human can act, and never changes the loop's behavior. Silent when nothing
-  /// has been recorded yet.
+  /// Prints the cross-run friction report at the end of a run. Advisory only;
+  /// silent when nothing has been recorded.
   void _printFrictionReport() {
     final report = summarize(traces.readAll());
     if (report.isEmpty) return;
@@ -205,12 +183,8 @@ class HarnessLoop {
     print(ansi.dim(report.render()));
   }
 
-  /// Records one completed `claude` call's telemetry to the durable cost ledger
-  /// (and the in-memory mirror the end-of-run report reads). Purely additive —
-  /// it never touches the `_prdCostUsd` accounting the PR comments report, so
-  /// the ledger and the human-facing spend number are sourced from the same
-  /// `result` event and cannot drift. [model] is null for an agent-pinned call
-  /// (`classify`/`prReview`) whose model the harness does not pass.
+  /// Records one completed `claude` call to the cost ledger and its in-memory
+  /// mirror. [model] is null for an agent-pinned call (`classify`/`prReview`).
   void _recordCall(
     CallPhase phase,
     ClaudeRun run, {
@@ -238,10 +212,8 @@ class HarnessLoop {
     calls.append(record);
   }
 
-  /// Prints this run's cost report — the spend split by phase and by model plus
-  /// the implement lane-tiering saving — at the end of a run. Advisory and
-  /// observability only: it never changes the loop's behavior. Silent when no
-  /// `claude` call was made (e.g. an empty queue).
+  /// Prints this run's spend split by phase and model. Silent when no `claude`
+  /// call was made.
   void _printCostReport() {
     final report = summarizeCalls(_runCalls);
     if (report.isEmpty) return;
@@ -272,13 +244,9 @@ class HarnessLoop {
       var processed = 0;
       var capHit = false;
       if (config.concurrency > 1) {
-        // Parallel path: a bounded worker pool drains the whole ready queue at
-        // the sub-issue grain (DAG-scheduled by `## Blocked by`), each slice in
-        // its own worktree, then merges per-PRD and opens one PR per PRD.
         processed = await _drainParallel(0);
         capHit = config.iterations != null && processed >= config.iterations!;
       } else {
-        // Sequential path (N=1) — unchanged, one PRD then one sub at a time.
         while (true) {
           final activeParent = await _selectActivePrd();
           if (activeParent == null) break;
@@ -290,9 +258,8 @@ class HarnessLoop {
         }
       }
       if (!capHit) {
-        // Queue is drained. A PRD whose last failed sub was resolved (closed in
-        // a later run or by a human) never re-enters selection, so its branch
-        // would otherwise sit un-PR'd forever. Sweep for those and ship them.
+        // Ship any PRD whose work finished but never got a PR (its last failed
+        // sub was resolved out-of-band, so it never re-entered selection).
         await _shipStrandedPrds();
         print('No processable ready-for-agent issues remain. Done.');
       }
@@ -300,17 +267,28 @@ class HarnessLoop {
       events.event('DONE');
       return 0;
     } on ClaudeAbort catch (e) {
-      events.event('ABORT', detail: e.message);
+      events.event(
+        'ABORT',
+        detail: '${e.resumable ? 'resumable ' : ''}${e.message}',
+      );
+      if (e.resumable) {
+        // Usage limit: completed slices are checkpointed, the rest stay
+        // `ready-for-agent`. Exit EX_TEMPFAIL (75) so a wrapper re-runs once the
+        // window reopens and the idempotent harness resumes.
+        stderr.writeln(ansi.yellow('⏸ Usage limit reached — ${e.message}'));
+        stderr.writeln(
+          'Completed work was checkpointed; remaining issues stay '
+          'ready-for-agent. Re-run when the limit window resets to resume.',
+        );
+        return 75;
+      }
       stderr.writeln(ansi.red('✗ Fatal: ${e.message}'));
       stderr.writeln(
-        'claude cannot continue — aborting the AFK loop. '
-        'In-flight work is left uncommitted for a human.',
+        'claude cannot continue — aborting the AFK loop. Completed slices were '
+        'checkpointed; in-flight work is left for a human.',
       );
       return 2;
     } finally {
-      // Covers every exit (review-PR, single-issue, full drain, and abort): the
-      // spend summary prints once no matter which `return` fired. Silent when no
-      // `claude` call was made this run.
       _printCostReport();
     }
   }
@@ -409,11 +387,9 @@ class HarnessLoop {
     return passed ? 0 : 1;
   }
 
-  /// `--review-pr`: skip the whole implement loop and review an existing PR.
-  /// Checks out the PR's head, runs the full suite + the holistic diff-verifier
-  /// over `origin/<pr-base>..HEAD`, comments the verdict, and marks the PR ready
-  /// only when the suite is green and the review passes (a red result just
-  /// comments and leaves the PR untouched). Returns 0 on a green verdict.
+  /// `--review-pr`: review an existing PR instead of implementing. Runs the full
+  /// suite + diff-verifier over its diff, comments the verdict, and marks it
+  /// ready only when both are green. Returns 0 on a green verdict.
   Future<int> _reviewPr(String prRef) async {
     final info = await gh.prInfo(prRef);
     if (info == null) {
@@ -599,12 +575,9 @@ class HarnessLoop {
     return count;
   }
 
-  /// Ships any PRD branch whose work is done but never got a PR — typically a
-  /// PRD that had a failed sub which was later resolved (closed in a subsequent
-  /// run or by a human) without re-entering the `ready-for-agent` queue, so
-  /// [_drainPrd] never ran again to PR it. Idempotent: branches that already
-  /// have an open PR, still have open subs, or whose parent is closed are
-  /// skipped, so re-running the harness on a loop never re-opens or spams.
+  /// Ships any PRD branch whose work is done but never got a PR (a failed sub
+  /// resolved out-of-band, so [_drainPrd] never re-ran). Idempotent — see
+  /// [_strandedPrds] for the skip conditions.
   Future<void> _shipStrandedPrds() async {
     for (final entry in await _strandedPrds()) {
       final parent = entry.key;
@@ -637,9 +610,7 @@ class HarnessLoop {
     final branchByParent = <int, String>{};
     final chunkBranch = RegExp(r'-chunk-\d+-of-\d+-');
     for (final branch in await git.localBranches()) {
-      // Skip leftover stacked-PR chunk branches from an older split run: they
-      // hold only part of the PRD, so PR'ing one with `Closes #parent` would
-      // close the PRD on a partial diff. The canonical branch ships the whole.
+      // Skip leftover stacked-PR chunk branches: they hold only part of a PRD.
       if (chunkBranch.hasMatch(branch)) continue;
       final match = RegExp(r'^(\d+)-').firstMatch(branch);
       if (match == null) continue;
@@ -655,28 +626,27 @@ class HarnessLoop {
     return stranded;
   }
 
-  /// The PRD's sub-issues still in flight: open issues parented to
-  /// [activeParent] that the harness manages (`ready-for-agent` or
-  /// `ready-for-human`). A previously-failed sub that has since been closed is
-  /// no longer here, so it stops blocking the PR — this is the live-state
-  /// replacement for the old sticky in-run `prdFailed` flag.
+  /// The PRD's still-open managed subs (`ready-for-agent`/`ready-for-human`).
+  /// Excludes [activeParent] itself: a PRD-of-one is its own parent, so without
+  /// the guard a lagging list of the just-closed parent would block its own PR.
   Future<List<Issue>> _openSubsOf(int activeParent) async {
+    final byLabel = await Future.wait([
+      for (final label in const ['ready-for-agent', 'ready-for-human'])
+        gh.issuesWithLabel(label, 'open'),
+    ]);
     final byNumber = <int, Issue>{};
-    for (final label in const ['ready-for-agent', 'ready-for-human']) {
-      for (final issue in await gh.issuesWithLabel(label, 'open')) {
-        if (parentOf(issue.body, issue.number) == activeParent) {
-          byNumber[issue.number] = issue;
-        }
+    for (final issue in byLabel.expand((issues) => issues)) {
+      if (issue.number != activeParent &&
+          parentOf(issue.body, issue.number) == activeParent) {
+        byNumber[issue.number] = issue;
       }
     }
     return byNumber.values.toList();
   }
 
-  /// Cross-slice context for the implementer: the parent PRD's title+body plus a
-  /// roster of the sibling slices still in flight. Empty for a PRD-of-one (no
-  /// [parent]), so a standalone issue gets no noise. This is what lets the
-  /// implementer reconcile shared interfaces up front instead of leaving
-  /// cross-slice integration gaps for the single end-of-PRD review to drain.
+  /// Cross-slice context for the implementer — the parent PRD's title+body and a
+  /// roster of in-flight siblings — so it can reconcile shared interfaces up
+  /// front. Empty for a PRD-of-one (no [parent]).
   Future<({String prdContext, String sliceMap})> _coherenceContext(
     int? parent,
     int self,
@@ -697,6 +667,26 @@ class HarnessLoop {
     return (prdContext: prdContext.toString(), sliceMap: sliceMap);
   }
 
+  /// Leaves the PR-skip reason as a durable comment on the PRD issue. Idempotent:
+  /// a hidden signature of the cause (open subs + commits ahead) blocks a repost
+  /// until the cause changes.
+  Future<void> _commentPrSkip(
+    int prd,
+    List<Issue> openSubs,
+    int ahead,
+    String text,
+  ) async {
+    final signature =
+        '<!-- dartralph:pr-skip '
+        'subs=${openSubs.map((i) => i.number).join(',')} ahead=$ahead -->';
+    final existing = await gh.issueComments(prd);
+    if (existing.contains(signature)) return;
+    await gh.commentOnIssue(
+      prd,
+      '$signature\n\n🚧 **No PR opened yet.**\n\n$text',
+    );
+  }
+
   Future<void> _maybeOpenPr(int activeParent) async {
     final analyzeLog = _analyzeLogFor(activeParent);
     final testLog = _testLogFor(activeParent);
@@ -704,30 +694,41 @@ class HarnessLoop {
     final ahead = await git.aheadOf(config.base);
     final openSubs = await _openSubsOf(activeParent);
     if (openSubs.isNotEmpty || ahead == 0) {
-      final refs = openSubs.map((i) => '#${i.number}').join(', ');
+      final branch = await git.currentBranch();
+      final explain = prSkipExplanation(
+        prd: activeParent,
+        ahead: ahead,
+        base: config.base,
+        branch: branch,
+        openSubs: [
+          for (final i in openSubs)
+            (
+              number: i.number,
+              needsHuman: i.labels.contains('ready-for-human'),
+            ),
+        ],
+      );
       events.event(
         'PR_SKIP',
         prd: activeParent,
-        detail: 'open_subs=${openSubs.length} commits_ahead=$ahead',
+        detail:
+            'open_subs=${openSubs.length} commits_ahead=$ahead '
+            'needs_human=${explain.needsHuman}',
       );
-      print(
-        '  PRD #$activeParent not PR\'d '
-        '(open_subs=${openSubs.length}${refs.isEmpty ? '' : ' [$refs]'}, '
-        'commits_ahead=$ahead). Branch left for human.',
-      );
+      print('  ${explain.text.replaceAll('\n', '\n  ')}');
+      if (explain.needsHuman) {
+        await _commentPrSkip(activeParent, openSubs, ahead, explain.text);
+      }
       return;
     }
 
     _phase(HarnessPhase.pr, 'PRD #$activeParent');
     final title = await gh.issueTitle(activeParent);
     final canonical = await git.currentBranch();
-    // The harness no longer splits PRDs; close any leftover stacked-PR chunk
-    // PRs from an older split run so the single PR does not sit beside orphans.
     await gh.closeChunkPrs(activeParent);
 
-    // Mechanical gate: the whole suite once over the canonical (full PRD) tree —
-    // a red base (pre-existing failures) keeps the PRD a draft for a human;
-    // work is never discarded here, only the auto-ready signal is withheld.
+    // The whole suite once over the full PRD tree. A red base keeps the PRD a
+    // draft for a human — work is never discarded, only the ready signal held.
     var analyzeOk = await _gate(HarnessPhase.analyze, [
       'flutter',
       'analyze',
@@ -735,9 +736,8 @@ class HarnessLoop {
     var testOk = await _gate(HarnessPhase.test, ['flutter', 'test'], testLog);
     _logGates(activeParent, null, analyzeOk: analyzeOk, testOk: testOk);
 
-    // One holistic review over the whole PRD diff (origin/<base>..HEAD on the
-    // canonical branch). The reviewer reads the local commit range, so no PR
-    // need exist yet, and a single review covers the whole PRD.
+    // One holistic review over the whole PRD diff (origin/<base>..HEAD). The
+    // reviewer reads the local commit range, so no PR need exist yet.
     Future<ClaudeRun> runReview() async {
       _phase(HarnessPhase.review, 'PR #$activeParent');
       final r = await _runWithApiRetry(
@@ -767,12 +767,9 @@ class HarnessLoop {
       detail: pass ? 'pass' : 'fail',
     );
 
-    // Auto-fix loop: gates green but the reviewer FAILED → feed the blocking
-    // findings to a PRD-level fixer, commit, re-gate, re-review — up to
-    // config.maxReviewFixes rounds. Only when the gates are green: a red build
-    // is a human's problem, never something we keep auto-patching. A fixer that
-    // produces no drift has nothing more to offer, so we stop and let the
-    // standing verdict decide the PR.
+    // Gates green but reviewer FAILED → feed the blocking findings to a fixer,
+    // commit, re-gate, re-review, up to config.maxReviewFixes rounds. A red
+    // build or a no-op fix stops the loop and lets the standing verdict decide.
     for (
       var round = 1;
       !pass && analyzeOk && testOk && round <= config.maxReviewFixes;
@@ -872,19 +869,15 @@ class HarnessLoop {
         '\$${_prdCostUsd.toStringAsFixed(4)}._';
     final green = analyzeOk && testOk && pass;
 
-    // One PR per PRD on the canonical branch. A re-run reuses the existing PR
-    // (push updates it in place) instead of opening a new one.
     final url = await _openOnePr(activeParent, title, canonical);
     if (url == null) return;
     await gh.commentOnPr(url, reviewBody);
 
     if (green) {
-      // The local gates and review are green; the PR was opened as a draft.
-      // Unless watching is off, follow its remote CI to a conclusion before
-      // marking it ready — a build green on `fvm flutter` here can still fail
-      // the PR's GitHub Actions (a different OS, golden tests, integration
-      // suites, codegen). CI failures are fed back to a fixer up to
-      // config.maxCiFixes rounds; a repo with no checks auto-skips the wait.
+      // Local gates + review green. Follow the PR's remote CI to a conclusion
+      // before marking ready — GitHub Actions can fail what `fvm flutter` here
+      // never runs (a different OS, golden tests, codegen). `--watch-ci=0` and
+      // a repo with no checks both skip the wait.
       if (!config.watchCi) {
         await gh.markPrReady(url);
         events.event('PR_READY', prd: activeParent, detail: 'url=$url ci=off');
@@ -945,8 +938,8 @@ class HarnessLoop {
       }
     }
 
-    // Red gate or rejected review: demote to draft (a prior run may have marked
-    // it ready) and leave it for a human. Nothing is rolled back here.
+    // Red gate or rejected review: demote to draft for a human. Nothing rolled
+    // back.
     if (!pass) {
       traces.append(
         TraceRecord(
@@ -976,20 +969,12 @@ class HarnessLoop {
     );
   }
 
-  /// Watches the just-opened (draft) PR's remote CI to a conclusion, auto-fixing
-  /// failures up to [Config.maxCiFixes] rounds. The local gates and the review
-  /// are already green; this is the remote backstop a `fvm flutter` build cannot
-  /// see (a different OS, golden tests, integration suites, codegen). Polling
-  /// backs off (30s → 60s → 120s via [ciPollInterval]) with a 60s grace before
-  /// trusting an empty rollup, so a PR whose checks have not registered yet is
-  /// not mistaken for one with no CI. Returns:
-  ///
-  /// - [_CiOutcome.ready]    CI passed and the branch is not in conflict.
-  /// - [_CiOutcome.noCi]     no checks after the grace — caller marks ready.
-  /// - [_CiOutcome.failed]   CI stayed red past the fix budget, a fix regressed
-  ///                         the local gates / produced no change / leaked a
-  ///                         secret, the push failed, or the branch conflicts.
-  /// - [_CiOutcome.timedOut] CI never settled within [Config.ciTimeout].
+  /// Watches the draft PR's remote CI to a conclusion, auto-fixing failures up
+  /// to [Config.maxCiFixes] rounds. Polling backs off (30s → 60s → 120s via
+  /// [ciPollInterval]) with a 60s grace before trusting an empty rollup. Returns
+  /// [_CiOutcome.ready] (green, not in conflict), [_CiOutcome.noCi] (no checks
+  /// after the grace), [_CiOutcome.failed] (red past the budget / a fix could
+  /// not land / branch conflicts), or [_CiOutcome.timedOut].
   Future<_CiOutcome> _watchCi(
     int activeParent,
     String title,
@@ -1002,8 +987,7 @@ class HarnessLoop {
     final start = DateTime.now();
     final deadline = start.add(config.ciTimeout);
     // A PR opened seconds ago may report no checks yet; only conclude "no CI"
-    // after this grace. A fix push extends it (the new commit's run must
-    // register), so a freshly-pushed head is never misread as no-CI.
+    // after this grace. A fix push resets it (the new run must register).
     var graceUntil = start.add(const Duration(seconds: 60));
     var fixes = 0;
 
@@ -1011,8 +995,7 @@ class HarnessLoop {
       final status = await gh.prCiStatus(url);
       switch (status.state) {
         case CiState.passing:
-          // A branch that conflicts with base cannot merge regardless of CI, so
-          // that is a human's call — leave it a draft rather than ready.
+          // A branch that conflicts with base cannot merge regardless of CI.
           if (status.mergeable == false) {
             events.event('CI_CONFLICT', prd: activeParent, detail: 'url=$url');
             print(
@@ -1076,9 +1059,7 @@ class HarnessLoop {
             );
             return _CiOutcome.failed;
           }
-          // The fix is pushed; the new commit's CI needs to register. Reset the
-          // grace so the next poll waits out the queueing run, not the stale
-          // failed one.
+          // Reset the grace so the next poll waits out the new queueing run.
           graceUntil = DateTime.now().add(const Duration(seconds: 60));
       }
 
@@ -1107,10 +1088,8 @@ class HarnessLoop {
     }
   }
 
-  /// Pushes [branch] and opens the single whole-PRD PR — or reuses the one that
-  /// already tracks [branch], so a re-run updates the existing PR in place
-  /// instead of opening a duplicate. Returns the PR url, or null on push/create
-  /// failure.
+  /// Pushes [branch] and opens the whole-PRD PR, reusing one that already tracks
+  /// [branch] so a re-run updates in place. Returns the url, or null on failure.
   Future<String?> _openOnePr(
     int activeParent,
     String title,
@@ -1148,9 +1127,8 @@ class HarnessLoop {
     return prUrl;
   }
 
-  /// Reads the PRD's analyze + test log tails and renders them via the pure
-  /// [gateEvidence] for the PR description. The FS read stays here; the wording
-  /// is unit-tested in `pr_comments.dart`.
+  /// Reads the PRD's gate log tails and renders them via [gateEvidence] for the
+  /// PR description.
   String _gateEvidence(int parent) => gateEvidence([
     for (final (label, path) in [
       ('analyze', _analyzeLogFor(parent)),
@@ -1159,8 +1137,7 @@ class HarnessLoop {
       if (File(path).existsSync()) (label, _tail(path, 15)),
   ]);
 
-  /// Reads the failing analyze/test log tails and renders the handoff via the
-  /// pure [failComment]. The FS read stays here; the wording is unit-tested.
+  /// Reads the failing gate log tails and renders the handoff via [failComment].
   String _failComment(
     int number, {
     required bool analyzeOk,

@@ -25,21 +25,19 @@ class ClaudeRun {
   final int peakContextTokens;
   final int contextWindow;
 
-  /// How much context headroom the agent had left at its peak, as a percentage
-  /// of the window — null when no usage was reported (e.g. the process died
-  /// before any `assistant` message). A low value means it ran close to the
-  /// limit and was at risk of truncating its own working memory.
+  /// Context headroom at the agent's peak, as a % of the window — null when no
+  /// usage was reported (process died before any `assistant` message). A low
+  /// value means it ran close to truncating its own working memory.
   double? get contextFreePct => peakContextTokens == 0
       ? null
       : ((contextWindow - peakContextTokens) / contextWindow * 100)
             .clamp(0, 100)
             .toDouble();
 
-  /// A *transient* API failure the loop can recover from by retrying the same
-  /// `claude` run after a backoff — an overloaded/5xx status, a dropped stream
-  /// that killed the process before a `result` arrived, or an exhausted internal
-  /// API retry. Null when the run is fine or the failure is hard (rate limit,
-  /// auth, billing — see [fatalError]).
+  /// A *transient* API failure the loop can retry after a backoff — an
+  /// overloaded/5xx status, a dropped stream that killed the process before a
+  /// `result`, or an exhausted internal retry. Null when fine or hard (rate
+  /// limit, auth, billing — see [fatalError]).
   String? get transientApiError {
     if (rateLimited != null) return null;
     final r = result;
@@ -51,10 +49,10 @@ class ClaudeRun {
     return null;
   }
 
-  /// A *hard*, unrecoverable condition — rate limit, auth/billing failure —
-  /// where every retry would fail the same way, so the loop must abort. A
-  /// transient API failure is [transientApiError] instead; a per-task failure
-  /// like `error_max_turns` or bad code the gates catch is neither.
+  /// A *hard*, unrecoverable condition — rate limit, auth/billing — where every
+  /// retry fails the same, so the loop must abort. A transient failure is
+  /// [transientApiError]; a per-task failure (`error_max_turns`, bad code the
+  /// gates catch) is neither.
   String? get fatalError {
     if (rateLimited != null) return rateLimited!.summary;
     final r = result;
@@ -64,22 +62,24 @@ class ClaudeRun {
   }
 }
 
-/// Thrown to unwind the loop when a `claude` run hits an unrecoverable
-/// condition (rate limit, auth/billing, streaming death). Caught at the top of
-/// [HarnessLoop.run], which prints [message] and exits non-zero.
+/// Thrown to unwind the loop when a `claude` run can no longer make progress.
+/// Caught at the top of [HarnessLoop.run], which prints [message] and exits.
+/// [resumable] splits the two kinds: a usage/rate limit reopens later, so work
+/// is checkpointed and the process exits retry-me; auth/billing/streaming is
+/// not — re-running fails the same, so it exits hard.
 class ClaudeAbort implements Exception {
-  ClaudeAbort(this.message);
+  ClaudeAbort(this.message, {this.resumable = false});
 
   final String message;
+  final bool resumable;
 
   @override
   String toString() => 'ClaudeAbort: $message';
 }
 
-/// The context window in tokens for [model], used to turn raw usage into a
-/// "% free" headroom figure. Every Claude model the harness currently targets
-/// (opus/sonnet/haiku) exposes a 200k window; the map is the seam for a model
-/// whose window differs from the default.
+/// The context window in tokens for [model], turning raw usage into a "% free"
+/// figure. Every model the harness targets exposes 200k; the map is the seam
+/// for one whose window differs.
 int contextWindowFor(String model) => _contextWindows[model] ?? 200000;
 
 const _contextWindows = <String, int>{};
@@ -91,14 +91,13 @@ class ClaudeRunner {
   final ProcessRunner _proc;
   final Ansi _ansi;
 
-  /// The repo a `claude` run executes in. `null` = the harness process's cwd; a
-  /// parallel worker passes its per-issue worktree path so the agent edits that
-  /// tree in isolation.
+  /// The repo a `claude` run executes in. `null` = the harness cwd; a parallel
+  /// worker passes its worktree path so the agent edits that tree in isolation.
   final String? workingDirectory;
 
-  /// When set, the live transcript is written here instead of stdout — a
-  /// parallel worker routes its agent output to a per-issue log file so the
-  /// console stays free for the multi-worker dashboard.
+  /// When set, the live transcript is written here instead of stdout — a worker
+  /// routes its agent output to a per-issue log so the console stays free for
+  /// the dashboard.
   final IOSink? logSink;
 
   Future<ClaudeRun> implement({
@@ -145,7 +144,9 @@ class ClaudeRunner {
   }) async {
     final renderer = StreamRenderer(
       sink: logSink,
-      ansi: _ansi,
+      // A log *file* is not a terminal: ANSI escapes would be written literally
+      // as `\x1B[…m` noise, so render plain there; stdout keeps its styling.
+      ansi: logSink == null ? _ansi : const Ansi(enabled: false),
       contextWindow: contextWindow,
     );
     await _proc.stream(

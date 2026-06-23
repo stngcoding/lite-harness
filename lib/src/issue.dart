@@ -51,30 +51,32 @@ String? phaseOf(String body) {
   return text.isEmpty ? null : text;
 }
 
-int parentOf(String body, int ownNumber) {
-  final section = _section(body, 'Parent');
-  final match = RegExp(r'#(\d+)|/issues/(\d+)').firstMatch(section);
-  final number = match?.group(1) ?? match?.group(2);
-  return number == null ? ownNumber : int.parse(number);
-}
+int parentOf(String body, int ownNumber) =>
+    _firstRef(_section(body, 'Parent')) ?? ownNumber;
 
 List<int> blockersOf(String body) {
   final section = _section(body, 'Blocked by');
-  // Convention: a "None" section means no blockers. Authors often add a prose
-  // explanation after it ("None — can start on the PR #338 branch") that itself
-  // mentions other issue/PR numbers; without this guard the `#N` regex would
-  // pick those incidental references up as phantom blockers and the issue would
-  // never be picked up while they stay open.
-  if (RegExp(r'^\s*none\b', caseSensitive: false).hasMatch(section)) return [];
-  return RegExp(
-    r'#(\d+)',
-  ).allMatches(section).map((m) => int.parse(m.group(1)!)).toList();
+  // A "None" section means no blockers. Stop here before the `#N` scan so prose
+  // after it ("None — start on PR #338") isn't read as a phantom blocker; the
+  // leading-markup tolerance also catches the inline `**Blocked by:** None …`.
+  if (RegExp(r'^[\s*_>-]*none\b', caseSensitive: false).hasMatch(section)) {
+    return [];
+  }
+  return RegExp(r'#(\d+)|/issues/(\d+)')
+      .allMatches(section)
+      .map((m) => int.parse(m.group(1) ?? m.group(2)!))
+      .toList();
 }
 
-/// Numbers of issues in [issues] that are the `## Parent` of at least one
-/// other issue — the umbrella PRDs. An umbrella only groups its slices and is
-/// closed by the PR (`Closes #parent`); implementing it as a work item redoes
-/// the whole PRD scope once more on top of every slice.
+int? _firstRef(String text) {
+  final match = RegExp(r'#(\d+)|/issues/(\d+)').firstMatch(text);
+  final number = match?.group(1) ?? match?.group(2);
+  return number == null ? null : int.parse(number);
+}
+
+/// Issue numbers that are the `## Parent` of at least one other issue — the
+/// umbrella PRDs. An umbrella only groups its slices (the PR closes it via
+/// `Closes #parent`); implementing it would redo the whole PRD scope per slice.
 Set<int> umbrellaNumbers(Iterable<Issue> issues) {
   final umbrellas = <int>{};
   for (final issue in issues) {
@@ -84,35 +86,39 @@ Set<int> umbrellaNumbers(Iterable<Issue> issues) {
   return umbrellas;
 }
 
-/// The ready slices eligible to start *right now*, given which issue numbers are
-/// already [satisfied] (closed before this run, or completed earlier in it) and
-/// which are [excluded] (already handled or currently in flight). A slice is
-/// eligible when it is not an umbrella and every `## Blocked by` issue is
-/// satisfied — the DAG-readiness rule the parallel scheduler hands work out by.
-/// Ordered by [sortReady] so the highest-priority unblocked slice schedules
-/// first. Pure (no GitHub state) so the scheduler's hardest correctness concern
-/// is unit-testable.
+/// The ready slices eligible to start right now: not [excluded] (handled or in
+/// flight), not an umbrella, and every `## Blocked by` issue and every [implicit]
+/// file-overlap blocker [satisfied] (closed before this run or passed in it).
+/// Ordered by [sortReady]. Pure (no GitHub state) so the scheduler's hardest
+/// correctness concern is unit-testable.
 List<Issue> eligibleSlices(
   List<Issue> ready, {
   required Set<int> satisfied,
   required Set<int> excluded,
+  Map<int, Set<int>> implicit = const {},
 }) {
   final umbrellas = umbrellaNumbers(ready);
   return sortReady([
     for (final issue in ready)
       if (!excluded.contains(issue.number) &&
           !umbrellas.contains(issue.number) &&
-          blockersOf(issue.body).every(satisfied.contains))
+          blockersOf(issue.body).every(satisfied.contains) &&
+          (implicit[issue.number] ?? const <int>{}).every(satisfied.contains))
         issue,
   ]);
 }
 
+/// The text under a `## $heading` block, or — when there is none — the remainder
+/// of an inline labeled line (`**Parent:** #366`, `- _Blocked by_: #264`). Both
+/// forms appear in human-written templates and must resolve to the same edges,
+/// or a PRD's slices silently detach from their umbrella.
 String _section(String body, String heading) {
+  final headingLine = RegExp('^## *$heading');
   final lines = body.split('\n');
   final buffer = StringBuffer();
   var inSection = false;
   for (final line in lines) {
-    if (RegExp('^## *$heading').hasMatch(line)) {
+    if (headingLine.hasMatch(line)) {
       inSection = true;
       continue;
     }
@@ -122,7 +128,13 @@ String _section(String body, String heading) {
     }
     if (inSection) buffer.writeln(line);
   }
-  return buffer.toString();
+  if (buffer.isNotEmpty) return buffer.toString();
+  final inline = RegExp(
+    '^[ \\t>*_-]*$heading[ \\t]*[*_]*[ \\t]*:(.*)\$',
+    caseSensitive: false,
+    multiLine: true,
+  ).firstMatch(body);
+  return inline?.group(1) ?? '';
 }
 
 String slugify(String input) {
