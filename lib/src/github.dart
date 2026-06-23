@@ -3,13 +3,20 @@ import 'dart:convert';
 import 'ci_status.dart';
 import 'context_budget.dart';
 import 'issue.dart';
+import 'issue_state.dart';
 import 'proc.dart';
 
 class GhCli {
-  GhCli(this._proc, this.repo);
+  GhCli(this._proc, this.repo, {IssueStateOverlay? overlay})
+    : _overlay = overlay ?? IssueStateOverlay();
 
   final ProcessRunner _proc;
   final String repo;
+
+  /// Reconciles every issue-list read against the harness's own confirmed
+  /// writes, so a just-closed/relabeled issue never reads back from GitHub's
+  /// lagging index as a still-open sub. See [IssueStateOverlay].
+  final IssueStateOverlay _overlay;
 
   static Future<String?> detectRepo(ProcessRunner proc) async {
     final result = await proc.run('gh', [
@@ -45,9 +52,11 @@ class GhCli {
     if (!result.ok) return const [];
     try {
       final list = jsonDecode(result.stdout) as List;
-      return [
+      final raw = [
         for (final json in list) Issue.fromJson(json as Map<String, dynamic>),
       ];
+      _overlay.observe(raw);
+      return _overlay.reconcile(raw, label: label, state: state);
     } on FormatException {
       return const [];
     }
@@ -203,7 +212,7 @@ class GhCli {
       '--remove-label',
       'ready-for-agent',
     ]);
-    await _quiet([
+    final closed = await _proc.run('gh', [
       'issue',
       'close',
       '$number',
@@ -212,19 +221,25 @@ class GhCli {
       '--comment',
       comment,
     ]);
+    // Trust the overlay to hide it only once the close took — a failed close
+    // leaves it open and must still block the PR.
+    if (closed.ok) _overlay.recordClosed(number);
   }
 
-  Future<void> relabelForHuman(int number) => _quiet([
-    'issue',
-    'edit',
-    '$number',
-    '--repo',
-    repo,
-    '--remove-label',
-    'ready-for-agent',
-    '--add-label',
-    'ready-for-human',
-  ]);
+  Future<void> relabelForHuman(int number) async {
+    final result = await _proc.run('gh', [
+      'issue',
+      'edit',
+      '$number',
+      '--repo',
+      repo,
+      '--remove-label',
+      'ready-for-agent',
+      '--add-label',
+      'ready-for-human',
+    ]);
+    if (result.ok) _overlay.recordRelabeledForHuman(number);
+  }
 
   Future<void> commentOnIssue(int number, String body) =>
       _quiet(['issue', 'comment', '$number', '--repo', repo, '--body', body]);
@@ -232,15 +247,18 @@ class GhCli {
   /// Removes `ready-for-agent` without closing or relabeling. Used to take an
   /// umbrella PRD out of the agent queue: it is not a work item and is closed
   /// by its PR's `Closes #parent`, so it should never re-enter selection.
-  Future<void> dropAgentLabel(int number) => _quiet([
-    'issue',
-    'edit',
-    '$number',
-    '--repo',
-    repo,
-    '--remove-label',
-    'ready-for-agent',
-  ]);
+  Future<void> dropAgentLabel(int number) async {
+    final result = await _proc.run('gh', [
+      'issue',
+      'edit',
+      '$number',
+      '--repo',
+      repo,
+      '--remove-label',
+      'ready-for-agent',
+    ]);
+    if (result.ok) _overlay.recordDroppedAgentLabel(number);
+  }
 
   Future<String?> createDraftPr({
     required String base,
@@ -290,10 +308,9 @@ class GhCli {
   Future<void> markPrDraft(String ref) =>
       _quiet(['pr', 'ready', ref, '--repo', repo, '--undo']);
 
-  /// The aggregate CI verdict for [ref] (a PR number or URL): check-run rollup
-  /// plus base-mergeability. A failed `gh` call or unparseable payload degrades
-  /// to [CiState.none], so the final phase treats it as "no CI to wait on"
-  /// rather than blocking forever on a transient `gh` hiccup.
+  /// The aggregate CI verdict for [ref]: check-run rollup plus base
+  /// mergeability. A failed `gh` call or unparseable payload degrades to
+  /// [CiState.none], so the final phase treats it as "no CI to wait on".
   Future<CiStatus> prCiStatus(String ref) async {
     final result = await _proc.run('gh', [
       'pr',
@@ -308,10 +325,9 @@ class GhCli {
     return parseCiStatus(result.stdout);
   }
 
-  /// The failed-step logs for each Actions run in [runIds] (`gh run view
-  /// --log-failed`), each clamped to its last [tailLines] lines and labeled by
-  /// run id. This is what the CI fixer reads to find the root cause. Runs whose
-  /// logs cannot be fetched are skipped, never fatal.
+  /// The failed-step logs for each Actions run in [runIds], each clamped to its
+  /// last [tailLines] lines and labeled by run id — what the CI fixer reads to
+  /// find the root cause. Unfetchable runs are skipped, never fatal.
   Future<String> ciFailedLogs(List<int> runIds, {int tailLines = 200}) async {
     final blocks = <String>[];
     for (final id in runIds) {
