@@ -31,7 +31,9 @@ dart compile exe bin/dartralph.dart -o build/dartralph   # standalone binary
 
 Key flags (all also read env vars): `--repo owner/name` (REPO),
 `--state open|closed|all` (STATE), `--base <branch>` (BASE, default `dev`),
-`--model <model>` (MODEL, default `opus`), `--issue N`, `--once`, `--dry-run`.
+`--model <model>` (MODEL, default `opus` — the top implementer model /
+escalation ceiling; cheap lanes start below it and climb on retries), `--issue
+N`, `--once`, `--dry-run`.
 
 ## Architecture
 
@@ -39,8 +41,26 @@ The entrypoint `bin/dartralph.dart` parses args, builds a `Config`, wires the
 collaborators, and hands off to `HarnessLoop.run()` in `lib/src/loop.dart`. The
 public surface is re-exported from `lib/dartralph.dart`.
 
-`HarnessLoop` is the orchestrator and holds all the policy; everything else is a
-thin, side-effecting wrapper around an external CLI:
+`HarnessLoop` is the orchestrator and holds all the policy. The class is large,
+so its body is split across `loop.dart` and three `part of 'loop.dart'` files —
+one Dart library, so the extensions keep full access to the loop's private
+state without any field-threading:
+
+- `loop.dart` — the core: construction, `run()`, PRD selection/draining, the PR
+  gate (`_maybeOpenPr`), and the stranded-PRD sweep.
+- `slice_runner.dart` — the slice lifecycle. Both the sequential drive
+  (`_processSub`) and a parallel worker (`_driveWorker`) route through one
+  `_runSlice(issue, io)`; the only per-mode differences (git/claude binding,
+  `claude`-call retry/cost policy, where narration goes, what pass/fail means)
+  live behind the `_SliceIo` seam (`_SeqSliceIo` / `_WorkerSliceIo`). There is
+  no longer a second hand-mirrored copy of the lifecycle to keep in sync.
+- `worker_pool.dart` — the parallel pool (`_drainParallel`, `_nextReady`,
+  `_runIssueInWorktree`, `_mergeAndPrAll`, the dashboard) plus `_Worker` /
+  `_WorkerOutcome`.
+- `ci_watcher.dart` — the CI fix/handoff helpers (`_runCiFix`,
+  `_commentCiHandoff`, the `_CiOutcome` outcomes).
+
+Everything else is a thin, side-effecting wrapper around an external CLI:
 
 - `GhCli` (`github.dart`) — wraps `gh`: list ready issues, read state/comments,
   label, comment, close, open/ready PRs.
@@ -92,7 +112,12 @@ tests — this is the code to touch carefully:
    uncommitted drift in a stash first).
 3. For each processable sub-issue: **Implement** (`claude -p`) → **commit**
    immediately → **gate** (`fvm flutter analyze` + a *scoped* `fvm flutter
-   test`). The test gate runs only the tests the slice's diff touches —
+   test`). The implement model is chosen by the slice's risk lane
+   (`model_ladder.dart`): tiny/normal slices open on Sonnet, high-risk on Opus,
+   and each failed retry climbs one rung toward the `--model` ceiling — a cheap
+   model takes the first shot, a smarter one is only paid for when a gate fails.
+   The model that ran is recorded on the slice's trace. The test gate runs only
+   the tests the slice's diff touches —
    `scopedTestFiles` (`test_scope.dart`) maps the changed paths to each changed
    `test/…_test.dart` plus the mirror `_test.dart` of every changed `lib/…dart`
    (`_scopedTestGate` filters those to the ones that exist). So a pre-existing
@@ -110,21 +135,86 @@ tests — this is the code to touch carefully:
    sub that failed earlier but was since closed no longer blocks the PR. In PR
    mode (`pr-verifier.md`)
    the orchestrator runs the reverse-engineered Anthropic `/code-review`
-   pipeline — triage → five independent review lenses (CLAUDE.md, bug scan, git
-   history, prior PRs, in-code comments) fanned out via `Task` → per-issue 0–100
-   confidence scoring → drop everything below 80 → a cited PASS/FAIL. It still
+   pipeline — triage → six independent review lenses (CLAUDE.md, bug scan, git
+   history, prior PRs, in-code comments, and a whole-diff **structural** lens)
+   fanned out via `Task` → per-issue 0–100 confidence scoring → drop everything
+   below 80 → a cited PASS/FAIL. The verdict is reserved for substance plus a
+   short, enumerated list of objective CLAUDE.md rules the structural lens
+   promotes from nit to block (a file pushed past its stated max length, a
+   function widget, a raw asset path, a hardcoded token, a silent catch, an
+   inline comment); subjective "code judo" simplifications never block. It still
    ends in the single bare `VERDICT:` line the harness reads. The reviewer also
-   emits `MANUAL:` lines for acceptance criteria the gates cannot settle from the
-   diff (UI, real-device perf, external-service behavior); `manualNotes`
-   (`manual_notes.dart`) parses them and `_manualSection` renders them as an
-   unchecked checklist on the draft PR for the human reviewer — surfaced, never
-   gated on.
-5. **Stranded-PRD sweep.** After the ready queue empties, `_shipStrandedPrds`
+   emits two surface-don't-gate channels, both parsed in `manual_notes.dart` and
+   rendered in `pr_comments.dart`: `MANUAL:` lines for acceptance criteria the
+   gates cannot settle from the diff (UI, real-device perf, external-service
+   behavior) → `manualNotes`/`manualSection` as an unchecked checklist; and
+   `STRUCTURAL:` lines for the structural lens's subjective simplifications →
+   `structuralNotes`/`structuralSection` as a "Maintainability review" section.
+   Both surface on the draft PR for the human — never gated on.
+5. **CI watch + auto-fix** (`--watch-ci`, default on). The local gates are a
+   `fvm flutter` build; the PR's GitHub Actions can still fail what that build
+   never runs (a different OS, golden/screenshot tests, integration suites,
+   codegen, a stricter analyzer). So when the local suite + review are green,
+   `_maybeOpenPr` does **not** mark the draft ready yet — `_watchCi` follows the
+   PR's remote CI to a conclusion first. It polls `gh pr view` (`prCiStatus` →
+   the pure, unit-tested `parseCiStatus`) with backoff (30s/60s/120s via
+   `ciPollInterval`) and a 60s grace before trusting an *empty* rollup, so a PR
+   whose checks have not registered yet is not misread as having none.
+   CI **green** (and the branch not `CONFLICTING`) → mark ready. **No checks**
+   after the grace → a repo without CI: mark ready off the local verdict (the
+   historical behavior; `--watch-ci=0`/`WATCH_CI=0` forces this path outright).
+   CI **failing** → fetch `gh run view --log-failed` (`ciFailedLogs`), feed the
+   tails to the `ci-fixer` agent (`ci-fixer.md`), commit its fix, **re-run the
+   local gates** (a CI fix must not regress them), re-push, and resume the
+   watch — up to `--max-ci-fixes` (default 3) rounds. Past the fix budget, a
+   local-gate regression, a no-op fix, a secret leak, a push failure, a base
+   **conflict**, or `--ci-timeout` (default 30m) elapsing all leave the PR a
+   draft with a handoff comment (`FrictionKind.ciFail` traced). Nothing is ever
+   rolled back here — the watch only withholds the auto-ready signal.
+6. **Stranded-PRD sweep.** After the ready queue empties, `_shipStrandedPrds`
    walks local `<parent#>-<slug>` branches and PRs any whose parent is still
    OPEN, has no open managed subs, commits ahead, and no existing open PR. This
    catches PRDs whose last failed sub was resolved (re-run or human close) after
    the PRD had already fallen out of selection — without it, that branch never
    gets a PR. Idempotent, so a looping harness never re-opens or spams.
+
+### Parallel mode (`--concurrency` > 1, default 2)
+
+The flow above is the **sequential path** (`concurrency == 1`), kept verbatim.
+When `--concurrency` is 2..4, `run()` forks into `_drainParallel` instead — a
+**single-driver, bounded worker pool** whose unit of parallelism is the
+*sub-issue*, not the PRD:
+
+- **One driver schedules.** Only `_nextReady` hands out work, called serially
+  between `await`s, so the in-flight/handled sets never race (Dart's single
+  isolate makes the mutations between two synchronous statements atomic — no
+  mutex needed). It picks the highest-priority slice whose every `## Blocked by`
+  issue is *satisfied* — CLOSED on GitHub **or** passed earlier this run
+  (`_passedThisRun`) — via the pure `eligibleSlices` (`issue.dart`, unit-tested).
+- **Worktree per slice.** Each slice runs in `.dartralph/worktrees/ralph-slice/<n>`
+  on branch `ralph-slice/<n>` cut from `origin/<base>`, then true-merged with the
+  branch of every blocker that passed *this run* (their work is not on base yet);
+  a merge conflict is a real integration clash → relabel `ready-for-human`, skip.
+  `GitOps` carries a `workingDirectory`, so each worker's `git`/`claude`/`fvm`
+  gates are scoped to its worktree. Per-issue output streams to
+  `.dartralph/logs/issue-<n>.log`, not stdout.
+- **`_driveWorker` shares the slice lifecycle with `_processSub`.** Both call the
+  single `_runSlice` (classify → implement → secret-scan → commit → analyze +
+  scoped test); the worker passes a `_WorkerSliceIo`, so a terminal pass records
+  a `_WorkerOutcome` for the merge phase instead of closing the issue and opening
+  a PR inline. N=1 stays untouched because it passes `_SeqSliceIo` to the very
+  same method — no second copy to drift.
+- **Rate-limit is recoverable here.** A `claude` rate limit pauses the *scheduler*
+  (`_rateLimitPausedUntil`) — in-flight workers ride their own retry backoff —
+  rather than aborting; only auth/billing/exhausted-transient throws `ClaudeAbort`
+  and drains the pool (`_callPausing`).
+- **Merge phase (`_mergeAndPrAll`).** After the pool drains, each PRD's passed
+  slices are cherry-picked in issue order onto its `<parent>-<slug>` branch, then
+  the unchanged PR gate (`_maybeOpenPr`: full suite + `diff-verifier` + the CI
+  watch of step 5) runs. A cherry-pick conflict ships a draft `[NEEDS HUMAN]`
+  PR; nothing is rolled back.
+- **Dashboard.** When stdout is a tty, a 1s `Timer` re-renders one status line per
+  in-flight slice (cursor-up overwrite); workers log to files so it never tears.
 
 ### Conventions that matter
 
@@ -138,9 +228,26 @@ tests — this is the code to touch carefully:
 - **Gates shell out to `fvm flutter`** in the *target* repo, writing logs to
   `/tmp/ralph-analyze.log` and `/tmp/ralph-test.log`. Per-issue the test gate is
   **scoped** to the slice's diff; the **full** suite runs once at the PR gate.
-- **Testing split:** pure logic (issue/stream/verdict parsing) is unit-tested;
-  the `gh`/`git`/`claude` wrappers are intentionally untested. Keep new pure
-  logic in those modules and cover it; keep the wrappers thin.
+- **Cost ledger (`call_log.dart`).** Every completed `claude` call appends one
+  `CallRecord` (phase, issue/prd, model, attempt, cost/turns/duration, ctx
+  headroom, outcome, denials) to `.dartralph/calls.jsonl` — a durable,
+  git-excluded mirror of `TraceStore`. The data the human transcript prints as
+  `└ N turns · $X · Ys` and then forgets is now recoverable for after-the-fact
+  analysis ("which phase/model burned the most on this PRD"). `_recordCall` wires
+  the six call sites (classify, implement, pr-review×2, review-fix, ci-fix); the
+  write is purely additive and never touches the `_prdCostUsd` PR-comment
+  accounting, so the ledger and the human-facing number share one `result`
+  source. At every run exit `_printCostReport` (`summarizeCalls` →
+  `CostReport.render`) prints this run's spend split by phase and by model plus an
+  estimated implement lane-tiering saving (the all-Opus counterfactual, grossing
+  each cheap-model call up by its `modelCostFactor`). Observability only — it
+  never changes loop behavior.
+- **Testing split:** pure logic (issue/stream/verdict parsing, the
+  `pr_comments.dart` builders) is unit-tested; the `gh`/`git`/`claude` wrappers
+  are intentionally untested. Keep new pure logic in those modules and cover it;
+  keep the wrappers thin. The parallel drive shares `_runSlice` with the
+  sequential path, so the sequential `loop_*` tests now exercise the same slice
+  lifecycle both modes run.
 
 ## Agent Skills
 

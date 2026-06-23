@@ -82,7 +82,11 @@ class FakeGit extends GitOps {
   @override
   Future<bool> hasDrift() async => true;
   @override
-  Future<bool> commitAll(String message) async => true;
+  Future<void> stageAll() async {}
+  @override
+  Future<String> stagedDiff() async => '';
+  @override
+  Future<bool> commitStaged(String message) async => true;
   @override
   Future<void> tagFail(int issueNumber) async {}
   @override
@@ -132,6 +136,7 @@ PromptLibrary _prompts() => PromptLibrary(
   prVerifier: PromptTemplate('pr-verifier', 'p', const {}),
   intake: PromptTemplate('intake', 'i', const {}),
   fixer: PromptTemplate('fixer', 'fix {{FINDINGS}}', const {'FINDINGS'}),
+  ciFixer: PromptTemplate('ci-fixer', 'ci {{LOGS}}', const {'LOGS'}),
 );
 
 Config _config() => const Config(
@@ -141,6 +146,8 @@ Config _config() => const Config(
   model: 'sonnet',
   dryRun: false,
   issueNumber: 9,
+  concurrency: 1,
+  watchCi: false,
 );
 
 HarnessLoop _loop(FakeGh gh, FlakyClaude claude, FakeGit git) => HarnessLoop(

@@ -1,22 +1,34 @@
 import 'proc.dart';
 
 class GitOps {
-  GitOps(this._proc);
+  GitOps(this._proc, {this.workingDirectory});
 
   final ProcessRunner _proc;
 
-  Future<String> _out(List<String> arguments) async =>
-      (await _proc.run('git', arguments)).stdout.trim();
+  /// The repo this instance operates in. `null` = the harness process's own cwd
+  /// (the canonical worktree); a parallel worker passes its per-issue worktree
+  /// path so its git commands act on that tree, not the shared one.
+  final String? workingDirectory;
 
-  Future<bool> _succeeds(List<String> arguments) async =>
-      (await _proc.run('git', arguments)).ok;
+  Future<String> _out(List<String> arguments) async => (await _proc.run(
+    'git',
+    arguments,
+    workingDirectory: workingDirectory,
+  )).stdout.trim();
+
+  Future<bool> _succeeds(List<String> arguments) async => (await _proc.run(
+    'git',
+    arguments,
+    workingDirectory: workingDirectory,
+  )).ok;
 
   /// Tooling artifacts rewritten by hooks while the loop runs; they must
   /// never ride along in issue commits or count as implementation drift. The
   /// bundled review agents the harness drops into the target repo are here too
   /// (mirrors `AgentInstaller.bundledAgents`): they are harness scaffolding,
-  /// not part of any issue's slice. `.dartralph/traces.jsonl` is the cross-run
-  /// friction log — harness state, never a slice artifact.
+  /// not part of any issue's slice. `.dartralph/traces.jsonl` (cross-run
+  /// friction) and `.dartralph/calls.jsonl` (the per-call cost ledger) are
+  /// harness state, never a slice artifact.
   static const artifactExcludes = [
     '.remember',
     '.claude/agents/diff-verifier.md',
@@ -24,6 +36,9 @@ class GitOps {
     '.claude/agents/pr-review-haiku.md',
     '.claude/agents/intake.md',
     '.dartralph/traces.jsonl',
+    '.dartralph/calls.jsonl',
+    '.dartralph/worktrees',
+    '.dartralph/logs',
   ];
 
   static final List<String> _workPathspecs = [
@@ -47,7 +62,12 @@ class GitOps {
   }
 
   Future<void> fetch(String base) async {
-    await _proc.run('git', ['fetch', 'origin', base, '--quiet']);
+    await _proc.run('git', [
+      'fetch',
+      'origin',
+      base,
+      '--quiet',
+    ], workingDirectory: workingDirectory);
   }
 
   Future<bool> branchExists(String branch) =>
@@ -98,16 +118,84 @@ class GitOps {
   Future<String> currentBranch() => _out(['rev-parse', '--abbrev-ref', 'HEAD']);
 
   Future<bool> commitAll(String message) async {
-    await _proc.run('git', ['add', '-A', '--', ..._workPathspecs]);
-    return _succeeds(['commit', '-q', '-m', message]);
+    await stageAll();
+    return commitStaged(message);
   }
 
+  /// Stages every changed work-path (artifacts excluded) without committing —
+  /// the seam the secret-scan inspects via [stagedDiff] before the commit is
+  /// allowed to land.
+  Future<void> stageAll() async {
+    await _proc.run('git', [
+      'add',
+      '-A',
+      '--',
+      ..._workPathspecs,
+    ], workingDirectory: workingDirectory);
+  }
+
+  Future<bool> commitStaged(String message) =>
+      _succeeds(['commit', '-q', '-m', message]);
+
+  /// The staged patch (`git diff --cached`) — what [stageAll] queued, scanned
+  /// for secrets before [commitStaged].
+  Future<String> stagedDiff() => _out(['diff', '--cached']);
+
+  /// Adds a linked worktree at `.dartralph/worktrees/<branch>` on a fresh
+  /// [branch] cut from [fromRef], so a parallel worker edits an isolated tree.
+  /// Returns the path, or null if the worktree could not be created.
+  Future<String?> createWorktree(String branch, String fromRef) async {
+    final path = '.dartralph/worktrees/$branch';
+    final ok = await _succeeds([
+      'worktree',
+      'add',
+      '-b',
+      branch,
+      path,
+      fromRef,
+    ]);
+    return ok ? path : null;
+  }
+
+  Future<void> removeWorktree(String path) async {
+    await _succeeds(['worktree', 'remove', '--force', path]);
+    await _succeeds(['worktree', 'prune']);
+  }
+
+  Future<bool> cherryPick(String sha) => _succeeds(['cherry-pick', sha]);
+
+  Future<void> cherryPickAbort() async {
+    await _succeeds(['cherry-pick', '--abort']);
+  }
+
+  /// Merges [ref] into the current branch (`--no-ff` by default so a diamond
+  /// base keeps a merge commit). Returns false on conflict — the caller then
+  /// [mergeAbort]s and hands the integration off to a human.
+  Future<bool> merge(String ref, {bool noFf = true}) =>
+      _succeeds(['merge', if (noFf) '--no-ff', '--no-edit', ref]);
+
+  Future<void> mergeAbort() async {
+    await _succeeds(['merge', '--abort']);
+  }
+
+  Future<bool> deleteBranch(String branch) =>
+      _succeeds(['branch', '-D', branch]);
+
   Future<void> tagFail(int issueNumber) async {
-    await _proc.run('git', ['tag', '-f', 'ralph-fail/$issueNumber', 'HEAD']);
+    await _proc.run('git', [
+      'tag',
+      '-f',
+      'ralph-fail/$issueNumber',
+      'HEAD',
+    ], workingDirectory: workingDirectory);
   }
 
   Future<void> resetHard(String ref) async {
-    await _proc.run('git', ['reset', '--hard', ref]);
+    await _proc.run('git', [
+      'reset',
+      '--hard',
+      ref,
+    ], workingDirectory: workingDirectory);
   }
 
   Future<bool> pushBranch(String branch) =>

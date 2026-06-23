@@ -23,6 +23,8 @@ enum FrictionKind {
   apiError,
   classifyFail,
   contextStarved,
+  secretLeak,
+  ciFail,
 }
 
 /// One issue's (or PR's) outcome for a run: its risk lane, how many attempts it
@@ -38,6 +40,7 @@ class TraceRecord {
     this.prd,
     this.detail,
     this.signature,
+    this.model,
   });
 
   factory TraceRecord.parse(String line) {
@@ -55,6 +58,7 @@ class TraceRecord {
       ],
       detail: json['detail'] as String?,
       signature: json['signature'] as String?,
+      model: json['model'] as String?,
     );
   }
 
@@ -74,6 +78,11 @@ class TraceRecord {
   /// bit [recurringSignatures] aggregates into the implementer's pitfalls digest.
   final String? signature;
 
+  /// The model the last implement attempt ran on (e.g. `sonnet`, `opus`), or
+  /// null for a trace written before model tiering. Makes the lane→model
+  /// tiering and any retry escalation visible in the log.
+  final String? model;
+
   String toJsonLine() => jsonEncode({
     'ts': ts,
     if (issue != null) 'issue': issue,
@@ -84,6 +93,7 @@ class TraceRecord {
     'frictions': [for (final f in frictions) f.name],
     if (detail != null) 'detail': detail,
     if (signature != null) 'signature': signature,
+    if (model != null) 'model': model,
   });
 }
 
@@ -208,6 +218,13 @@ const _suggestions = <FrictionKind, String>{
   FrictionKind.contextStarved:
       'Slices ran the context window low before failing — they are likely too '
       'large; split them into smaller sub-issues.',
+  FrictionKind.secretLeak:
+      'Slices keep adding apparent secrets — tighten the implementer prompt to '
+      'use env/secret storage and never hardcode credentials.',
+  FrictionKind.ciFail:
+      'PRs keep failing remote CI after passing local gates — the local gates '
+      'diverge from CI (a step, OS, or check CI runs that the harness does '
+      'not); align the local gates with the CI workflow.',
 };
 
 /// Aggregates [records] into a [FrictionReport]: friction counts, per-lane

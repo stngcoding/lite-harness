@@ -84,6 +84,29 @@ Set<int> umbrellaNumbers(Iterable<Issue> issues) {
   return umbrellas;
 }
 
+/// The ready slices eligible to start *right now*, given which issue numbers are
+/// already [satisfied] (closed before this run, or completed earlier in it) and
+/// which are [excluded] (already handled or currently in flight). A slice is
+/// eligible when it is not an umbrella and every `## Blocked by` issue is
+/// satisfied — the DAG-readiness rule the parallel scheduler hands work out by.
+/// Ordered by [sortReady] so the highest-priority unblocked slice schedules
+/// first. Pure (no GitHub state) so the scheduler's hardest correctness concern
+/// is unit-testable.
+List<Issue> eligibleSlices(
+  List<Issue> ready, {
+  required Set<int> satisfied,
+  required Set<int> excluded,
+}) {
+  final umbrellas = umbrellaNumbers(ready);
+  return sortReady([
+    for (final issue in ready)
+      if (!excluded.contains(issue.number) &&
+          !umbrellas.contains(issue.number) &&
+          blockersOf(issue.body).every(satisfied.contains))
+        issue,
+  ]);
+}
+
 String _section(String body, String heading) {
   final lines = body.split('\n');
   final buffer = StringBuffer();

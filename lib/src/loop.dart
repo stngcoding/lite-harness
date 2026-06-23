@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'ansi.dart';
+import 'call_log.dart';
+import 'ci_status.dart';
 import 'claude.dart';
 import 'config.dart';
 import 'context_budget.dart';
@@ -8,17 +11,28 @@ import 'event_log.dart';
 import 'git.dart';
 import 'github.dart';
 import 'issue.dart';
-import 'manual_notes.dart';
+import 'model_ladder.dart';
 import 'phase.dart';
+import 'pr_comments.dart';
 import 'proc.dart';
 import 'prompts.dart';
 import 'retry_feedback.dart';
+import 'secret_scan.dart';
 import 'test_scope.dart';
 import 'trace.dart';
 import 'verdict.dart';
 
-const _analyzeLog = '/tmp/ralph-analyze.log';
-const _testLog = '/tmp/ralph-test.log';
+part 'ci_watcher.dart';
+part 'slice_runner.dart';
+part 'worker_pool.dart';
+
+/// Per-issue gate log paths. Keyed by issue/PRD number so two slices gating
+/// concurrently (parallel pool) never clobber each other's log — and so a
+/// cross-suite parallel `dart test` no longer reads a half-written shared file
+/// (the historical flaky source). Sequential runs key by the same number, so
+/// behavior is unchanged at N=1.
+String _analyzeLogFor(int number) => '/tmp/ralph-$number-analyze.log';
+String _testLogFor(int number) => '/tmp/ralph-$number-test.log';
 
 class HarnessLoop {
   HarnessLoop({
@@ -31,6 +45,7 @@ class HarnessLoop {
     this.rulesSystemPrompt = '',
     EventLog? events,
     TraceStore? traces,
+    CallLog? calls,
     Ansi? ansi,
     this.apiRetryBackoff = const [
       Duration(seconds: 5),
@@ -39,6 +54,7 @@ class HarnessLoop {
     ],
   }) : events = events ?? EventLog(),
        traces = traces ?? TraceStore(),
+       calls = calls ?? CallLog(),
        ansi = ansi ?? Ansi.forStdout();
 
   final Config config;
@@ -60,6 +76,16 @@ class HarnessLoop {
   /// [TraceRecord]; [run] prints a [summarize] report at the end so repeated
   /// friction across runs surfaces as advisory proposals.
   final TraceStore traces;
+
+  /// Durable per-call cost ledger. Every completed `claude` call appends one
+  /// [CallRecord] (phase, model, cost/turns/duration) via [_recordCall], so the
+  /// spend that the human transcript prints and forgets is recoverable for
+  /// later analysis. [_printCostReport] summarizes this run's calls at the end.
+  final CallLog calls;
+
+  /// This run's [CallRecord]s in order, mirrored in memory so [_printCostReport]
+  /// scopes to the current run without re-reading the cross-run [calls] file.
+  final List<CallRecord> _runCalls = [];
 
   final Ansi ansi;
 
@@ -85,6 +111,42 @@ class HarnessLoop {
   /// the loop implement it a second time. This in-memory guard makes selection
   /// independent of that read-after-write lag.
   final Set<int> _handled = {};
+
+  /// Parallel mode only (`concurrency > 1`). Issue numbers whose slice passed
+  /// its gates *this run*. A passed slice is not closed until the merge phase
+  /// (its commit must first land on the PRD branch), so its blocker dependents
+  /// cannot rely on GitHub state alone to know it is done — this set is the
+  /// in-run half of the DAG-readiness check in [_nextReady].
+  final Set<int> _passedThisRun = {};
+
+  /// Parallel mode only. Per-PRD `claude` spend, summed across that PRD's slices
+  /// run in their own worktrees. The sequential [_prdCostUsd] cannot be shared
+  /// across concurrent PRDs, so the pool accumulates here and copies the total
+  /// into [_prdCostUsd] just before each PRD's PR is opened.
+  final Map<int, double> _prdCostAccum = {};
+
+  /// Parallel mode only. Each slice's terminal outcome, keyed by issue number —
+  /// what the merge phase ([_mergeAndPrAll]) cherry-picks onto each PRD branch.
+  final Map<int, _WorkerOutcome> _workerOutcomes = {};
+
+  /// Parallel mode only. Live worker registry for the dashboard.
+  final Map<int, _Worker> _workers = {};
+
+  /// Parallel mode only. When a `claude` run reports a rate limit, the scheduler
+  /// stops launching new slices until this instant; in-flight workers ride their
+  /// own [_runWithApiRetry] backoff. Null when not paused.
+  DateTime? _rateLimitPausedUntil;
+
+  /// Parallel mode only. Set when an in-flight worker hits an unrecoverable
+  /// condition (auth/billing/exhausted-transient). The scheduler stops launching
+  /// new work, lets in-flight workers drain, then rethrows so [run] aborts.
+  ClaudeAbort? _hardAbort;
+
+  /// Parallel mode only. Drives the live worker dashboard; null when not running
+  /// or when stdout is not a terminal. [_dashboardLines] is the height of the
+  /// block last drawn, so the next render can move the cursor up to overwrite it.
+  Timer? _dashboardTimer;
+  int _dashboardLines = 0;
 
   /// Prints the active-stage marker, e.g. `▶ IMPLEMENT — #123 fix login`.
   void _phase(HarnessPhase phase, [String? detail]) =>
@@ -143,6 +205,50 @@ class HarnessLoop {
     print(ansi.dim(report.render()));
   }
 
+  /// Records one completed `claude` call's telemetry to the durable cost ledger
+  /// (and the in-memory mirror the end-of-run report reads). Purely additive —
+  /// it never touches the `_prdCostUsd` accounting the PR comments report, so
+  /// the ledger and the human-facing spend number are sourced from the same
+  /// `result` event and cannot drift. [model] is null for an agent-pinned call
+  /// (`classify`/`prReview`) whose model the harness does not pass.
+  void _recordCall(
+    CallPhase phase,
+    ClaudeRun run, {
+    int? issue,
+    int? prd,
+    String? model,
+    int? attempt,
+  }) {
+    final result = run.result;
+    final record = CallRecord(
+      ts: DateTime.now().toIso8601String(),
+      phase: phase,
+      issue: issue,
+      prd: prd,
+      model: model,
+      attempt: attempt,
+      costUsd: result?.costUsd ?? 0,
+      numTurns: result?.numTurns ?? 0,
+      durationMs: result?.durationMs ?? 0,
+      ctxFreePct: run.contextFreePct,
+      outcome: result?.subtype,
+      denials: result?.permissionDenials ?? 0,
+    );
+    _runCalls.add(record);
+    calls.append(record);
+  }
+
+  /// Prints this run's cost report — the spend split by phase and by model plus
+  /// the implement lane-tiering saving — at the end of a run. Advisory and
+  /// observability only: it never changes the loop's behavior. Silent when no
+  /// `claude` call was made (e.g. an empty queue).
+  void _printCostReport() {
+    final report = summarizeCalls(_runCalls);
+    if (report.isEmpty) return;
+    print('');
+    print(ansi.dim(report.render()));
+  }
+
   Future<int> run() async {
     if (config.dryRun) return _dryRun();
     events.event(
@@ -165,13 +271,22 @@ class HarnessLoop {
 
       var processed = 0;
       var capHit = false;
-      while (true) {
-        final activeParent = await _selectActivePrd();
-        if (activeParent == null) break;
-        processed += await _drainPrd(activeParent, processed);
-        if (config.iterations != null && processed >= config.iterations!) {
-          capHit = true;
-          break;
+      if (config.concurrency > 1) {
+        // Parallel path: a bounded worker pool drains the whole ready queue at
+        // the sub-issue grain (DAG-scheduled by `## Blocked by`), each slice in
+        // its own worktree, then merges per-PRD and opens one PR per PRD.
+        processed = await _drainParallel(0);
+        capHit = config.iterations != null && processed >= config.iterations!;
+      } else {
+        // Sequential path (N=1) — unchanged, one PRD then one sub at a time.
+        while (true) {
+          final activeParent = await _selectActivePrd();
+          if (activeParent == null) break;
+          processed += await _drainPrd(activeParent, processed);
+          if (config.iterations != null && processed >= config.iterations!) {
+            capHit = true;
+            break;
+          }
         }
       }
       if (!capHit) {
@@ -192,6 +307,11 @@ class HarnessLoop {
         'In-flight work is left uncommitted for a human.',
       );
       return 2;
+    } finally {
+      // Covers every exit (review-PR, single-issue, full drain, and abort): the
+      // spend summary prints once no matter which `return` fired. Silent when no
+      // `claude` call was made this run.
+      _printCostReport();
     }
   }
 
@@ -323,11 +443,11 @@ class HarnessLoop {
     final analyzeOk = await _gate(HarnessPhase.analyze, [
       'flutter',
       'analyze',
-    ], _analyzeLog);
+    ], _analyzeLogFor(info.number));
     final testOk = await _gate(HarnessPhase.test, [
       'flutter',
       'test',
-    ], _testLog);
+    ], _testLogFor(info.number));
     _logGates(info.number, null, analyzeOk: analyzeOk, testOk: testOk);
 
     _phase(HarnessPhase.review, 'PR #${info.number}');
@@ -344,6 +464,7 @@ class HarnessLoop {
       'PR review #${info.number}',
     );
     _prdCostUsd += review.result?.costUsd ?? 0;
+    _recordCall(CallPhase.prReview, review, prd: info.number);
     _abortIfFatal(review, 'PR review #${info.number}');
     final verdict = review.transcript;
     events.event(
@@ -362,7 +483,8 @@ class HarnessLoop {
       info.url,
       '**AFK PR review (diff-verifier)**\n\n$suiteLine\n\n'
       '${reviewComment(verdict)}$reviewSummary'
-      '${_manualSection(verdict)}'
+      '${manualSection(verdict)}'
+      '${structuralSection(verdict)}'
       '\n\n_AFK review spend: \$${_prdCostUsd.toStringAsFixed(4)}._',
     );
     if (green) {
@@ -575,398 +697,9 @@ class HarnessLoop {
     return (prdContext: prdContext.toString(), sliceMap: sliceMap);
   }
 
-  Future<bool> _processSub(Issue issue) async {
-    _handled.add(issue.number);
-    final parent = parentOf(issue.body, issue.number);
-    final prdRef = parent == issue.number ? null : parent;
-    events.event('ISSUE_START', prd: prdRef, issue: issue.number);
-    final comments = await gh.issueComments(issue.number);
-    final coherence = await _coherenceContext(prdRef, issue.number);
-
-    final issuePhase = phaseOf(issue.body);
-    const rule = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
-    print(ansi.dim(rule));
-    print('  ${ansi.bold('Issue #${issue.number}')}: ${issue.title}');
-    if (issuePhase != null) print('  Phase: ${ansi.dim(issuePhase)}');
-    print('  ${ansi.dim(issue.url)}');
-    print(ansi.dim(rule));
-
-    // Friction this slice hits, deduped (a Set): one TraceRecord is appended
-    // per terminal outcome, so a gate that fails on every attempt counts once.
-    final frictions = <FrictionKind>{};
-
-    // Classify the slice's risk lane before implementing. An isolated intake
-    // agent (its own system prompt) reads the issue + PRD context and emits a
-    // bare `LANE:` line. The lane only tunes the implementer guidance and the
-    // PR reviewer's bar — it never blocks the loop, so an unparseable verdict
-    // safely defaults to `normal`.
-    _phase(HarnessPhase.classify, '#${issue.number}');
-    Future<ClaudeRun> classify() => _runWithApiRetry(
-      () => claude.classify(
-        prompts.intake(issue: issue, prdContext: coherence.prdContext),
-      ),
-      'Classify #${issue.number}',
-    );
-    var classifyRun = await classify();
-    _prdCostUsd += classifyRun.result?.costUsd ?? 0;
-    _abortIfFatal(classifyRun, 'Classify #${issue.number}');
-    var parsedLane = parseLane(classifyRun.transcript);
-    if (parsedLane == null) {
-      // Intake emitted no bare LANE: line — retry once before defaulting, since
-      // a single dropped line is usually transient, not a real classification.
-      print(
-        ansi.dim('  Intake emitted no lane — retrying classification once.'),
-      );
-      classifyRun = await classify();
-      _prdCostUsd += classifyRun.result?.costUsd ?? 0;
-      _abortIfFatal(classifyRun, 'Classify #${issue.number}');
-      parsedLane = parseLane(classifyRun.transcript);
-    }
-    // A missing lane is only friction worth reporting when the slice does not
-    // pass anyway — defaulting to `normal` on a slice that then sails through
-    // gates is harmless noise. recordTrace adds classifyFail per outcome.
-    final laneMissing = parsedLane == null;
-    final lane = parsedLane ?? RiskLane.normal;
-    final prevLane = _prdLane[parent];
-    if (prevLane == null || lane.index > prevLane.index) {
-      _prdLane[parent] = lane;
-    }
-    events.event('LANE', prd: prdRef, issue: issue.number, detail: lane.label);
-    print(
-      '  Risk lane: ${ansi.bold(lane.label)}'
-      '${parsedLane == null ? ansi.dim(' (defaulted; intake emitted none)') : ''}',
-    );
-
-    final baseline = await git.head();
-
-    // One sub-issue gets up to `config.maxAttempts` shots: implement → commit
-    // → gate. A failing attempt is rolled back to [baseline] and the agent is
-    // re-run with the failing analyze/test logs fed back via `{{RETRY}}`, so it
-    // fixes forward instead of repeating the same mistake. Only after every
-    // attempt fails does the issue get tagged and handed to a human.
-    var analyzeOk = false;
-    var testOk = false;
-    var implementSummary = '';
-    var ctxDetail = '';
-    var retry = '';
-
-    // The last implement run's context headroom (percent free), so a slice that
-    // failed while starved of context can be flagged as likely too big.
-    double? lastFreePct;
-
-    // The repo's recurring error signatures, fed to the implementer on its first
-    // attempt only (a retry already carries the specific failing logs). Advisory.
-    final pitfalls = recurringSignatures(traces.readAll());
-
-    // Appends this slice's single trace at a terminal outcome. Captures
-    // [analyzeOk]/[testOk]/[ctxDetail] by reference so the detail reflects the
-    // last gate and the last implement run's context headroom. A missing lane
-    // only counts as friction on a non-pass outcome (denoise — see above).
-    // [signature] is the one-line gate error this outcome left behind (null on a
-    // pass) — what [recurringSignatures] later aggregates into the digest above.
-    void recordTrace(String outcome, int attempts, {String? signature}) {
-      final hit = {...frictions};
-      if (laneMissing && outcome != 'pass') hit.add(FrictionKind.classifyFail);
-      traces.append(
-        TraceRecord(
-          ts: DateTime.now().toIso8601String(),
-          issue: issue.number,
-          prd: prdRef,
-          lane: lane,
-          outcome: outcome,
-          attempts: attempts,
-          frictions: hit.toList(),
-          detail:
-              'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}$ctxDetail',
-          signature: signature,
-        ),
-      );
-    }
-
-    for (var attempt = 1; attempt <= config.maxAttempts; attempt++) {
-      if (attempt > 1) {
-        print(
-          '  ${ansi.dim('↻ retry $attempt/${config.maxAttempts} for '
-          '#${issue.number} — feeding the failing logs back to the agent.')}',
-        );
-        await git.resetHard(baseline);
-      }
-
-      _phase(
-        HarnessPhase.implement,
-        '#${issue.number} ${issue.title}'
-        '${attempt > 1 ? ' (attempt $attempt/${config.maxAttempts})' : ''}',
-      );
-      events.event(
-        'IMPLEMENT',
-        prd: prdRef,
-        issue: issue.number,
-        detail: 'attempt=$attempt/${config.maxAttempts}',
-      );
-      final run = await _runWithApiRetry(
-        () => claude.implement(
-          model: config.model,
-          prompt: prompts.implementer(
-            issue: issue,
-            comments: comments,
-            prdContext: coherence.prdContext,
-            sliceMap: coherence.sliceMap,
-            base: config.base,
-            retry: retry,
-            lane: lane,
-            pitfalls: attempt == 1 ? pitfalls : const [],
-          ),
-          systemAppend: rulesSystemPrompt,
-        ),
-        'Implement #${issue.number}',
-      );
-      _prdCostUsd += run.result?.costUsd ?? 0;
-      _abortIfFatal(run, 'Implement #${issue.number}');
-      implementSummary = run.result == null
-          ? ''
-          : '\n\nImplement: ${run.result!.summary}.';
-      final freePct = run.contextFreePct;
-      lastFreePct = freePct;
-      ctxDetail = freePct == null ? '' : ' ctx=${freePct.round()}%free';
-      print('');
-
-      if (!await git.hasDrift()) {
-        // No uncommitted changes — current state may already satisfy the issue
-        // (e.g. a prior human commit resolved it), or the agent simply produced
-        // nothing this attempt. Gate it: green means done; otherwise retry.
-        analyzeOk = await _gate(HarnessPhase.analyze, [
-          'flutter',
-          'analyze',
-        ], _analyzeLog);
-        testOk = await _scopedTestGate(baseline, issue.number);
-        _logGates(prdRef, issue.number, analyzeOk: analyzeOk, testOk: testOk);
-        if (analyzeOk && testOk) {
-          await gh.closeIssue(
-            issue.number,
-            'No new changes needed — current state passes all gates '
-            '(analyze + scoped tests).$implementSummary',
-          );
-          events.event(
-            'CLOSE',
-            prd: prdRef,
-            issue: issue.number,
-            detail: 'no-changes-pass',
-          );
-          recordTrace('pass', attempt);
-          print('  ${ansi.green('✓')} #${issue.number} already done → closed.');
-          return true;
-        }
-        frictions.add(FrictionKind.noChanges);
-        if (!analyzeOk) frictions.add(FrictionKind.gateAnalyzeFail);
-        if (!testOk) frictions.add(FrictionKind.gateTestFail);
-        events.event(
-          'RETRY',
-          prd: prdRef,
-          issue: issue.number,
-          detail: 'no-changes attempt=$attempt/${config.maxAttempts}',
-        );
-        retry = _retryFeedback(
-          analyzeOk: analyzeOk,
-          testOk: testOk,
-          noChanges: true,
-        );
-        print(
-          '  ${ansi.red('No changes produced for #${issue.number} '
-          '(attempt $attempt/${config.maxAttempts}).')}',
-        );
-        continue;
-      }
-
-      _phase(HarnessPhase.commit, '#${issue.number}');
-      final committed = await git.commitAll(
-        'feat(#${issue.number}): ${issue.title}\n\n'
-        'Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>',
-      );
-      if (!committed) {
-        events.event('COMMIT_FAIL', prd: prdRef, issue: issue.number);
-        frictions.add(FrictionKind.commitFail);
-        recordTrace('fail', attempt);
-        print('  ${ansi.red('commit failed for #${issue.number}')}');
-        return false;
-      }
-      events.event('COMMIT', prd: prdRef, issue: issue.number);
-
-      analyzeOk = await _gate(HarnessPhase.analyze, [
-        'flutter',
-        'analyze',
-      ], _analyzeLog);
-      testOk = await _scopedTestGate(baseline, issue.number);
-      _logGates(prdRef, issue.number, analyzeOk: analyzeOk, testOk: testOk);
-
-      if (analyzeOk && testOk) {
-        await gh.closeIssue(
-          issue.number,
-          'Verified by AFK loop on branch `${await git.currentBranch()}`: '
-          'analyze + scoped tests green.$implementSummary',
-        );
-        events.event('CLOSE', prd: prdRef, issue: issue.number, detail: 'pass');
-        recordTrace('pass', attempt);
-        print('  ${ansi.green('✓ #${issue.number} PASS → closed.')}');
-        return true;
-      }
-
-      if (!analyzeOk) frictions.add(FrictionKind.gateAnalyzeFail);
-      if (!testOk) frictions.add(FrictionKind.gateTestFail);
-      events.event(
-        'RETRY',
-        prd: prdRef,
-        issue: issue.number,
-        detail:
-            'attempt=$attempt/${config.maxAttempts} '
-            'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}',
-      );
-      retry = _retryFeedback(
-        analyzeOk: analyzeOk,
-        testOk: testOk,
-        previousAttempt: previousAttemptBlock(
-          await git.diff(baseline),
-          await git.diffStat(baseline),
-        ),
-      );
-      print(
-        ansi.red(
-          '  #${issue.number} attempt $attempt/${config.maxAttempts} FAILED '
-          '(analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}).',
-        ),
-      );
-    }
-
-    // Every attempt failed — preserve the last try and hand off to a human.
-    frictions.add(FrictionKind.retryExhausted);
-    // A slice that failed while nearly out of context is likely too big to land
-    // in one pass — flag it so the human (and the friction report) can see it.
-    final contextStarved = lastFreePct != null && lastFreePct < 15;
-    if (contextStarved) frictions.add(FrictionKind.contextStarved);
-    final signature = !analyzeOk && File(_analyzeLog).existsSync()
-        ? errorSignature(File(_analyzeLog).readAsStringSync())
-        : !testOk && File(_testLog).existsSync()
-        ? errorSignature(File(_testLog).readAsStringSync())
-        : null;
-    recordTrace('fail', config.maxAttempts, signature: signature);
-    events.event(
-      'FAIL',
-      prd: prdRef,
-      issue: issue.number,
-      detail:
-          'attempts=${config.maxAttempts} '
-          'analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}',
-    );
-    await git.tagFail(issue.number);
-    await git.resetHard(baseline);
-    await gh.relabelForHuman(issue.number);
-    await gh.commentOnIssue(
-      issue.number,
-      _failComment(
-        issue.number,
-        analyzeOk: analyzeOk,
-        testOk: testOk,
-        implementSummary: implementSummary,
-        contextStarved: contextStarved,
-      ),
-    );
-    print(
-      ansi.red(
-        '  #${issue.number} FAIL after ${config.maxAttempts} attempt(s) → '
-        'tagged ralph-fail/${issue.number}, rolled back, '
-        'relabeled ready-for-human.',
-      ),
-    );
-    return false;
-  }
-
-  /// The `{{RETRY}}` block fed to the implementer on a re-attempt: which gate
-  /// failed plus the tail of its log, so the agent fixes the real error instead
-  /// of repeating the same attempt blind.
-  String _retryFeedback({
-    required bool analyzeOk,
-    required bool testOk,
-    bool noChanges = false,
-    String previousAttempt = '',
-  }) {
-    final sections = <String>[];
-    if (noChanges) {
-      sections.add(
-        'Your previous attempt produced NO file changes, yet the issue is not '
-        'satisfied. You must actually edit the code this time.',
-      );
-    }
-    if (!analyzeOk && File(_analyzeLog).existsSync()) {
-      sections.add(
-        '`fvm flutter analyze` FAILED:\n```\n${_tail(_analyzeLog, 40)}\n```',
-      );
-    }
-    if (!testOk && File(_testLog).existsSync()) {
-      sections.add(
-        '`fvm flutter test` FAILED:\n```\n${_tail(_testLog, 40)}\n```',
-      );
-    }
-    return '\n---\n## Previous attempt failed — fix these before finishing\n'
-        'A prior automated attempt at this exact issue did not pass the gates. '
-        'Treat the errors below as the source of truth and resolve every one '
-        'of them.\n\n${sections.join('\n\n')}\n$previousAttempt';
-  }
-
-  /// The per-issue test gate: runs only the tests the slice's diff scopes to
-  /// (changed `*_test.dart` plus the mirror test of each changed `lib/` file),
-  /// so a slice is never failed for a pre-existing red test it did not touch.
-  /// The whole suite runs once at the PR gate. An empty scope passes — there is
-  /// nothing the slice changed to test here; the PR gate is the backstop.
-  Future<bool> _scopedTestGate(String baseline, int number) async {
-    final scoped = scopedTestFiles(
-      await git.changedFiles(baseline),
-    ).where((path) => File(path).existsSync()).toList()..sort();
-    if (scoped.isEmpty) {
-      print(
-        '  ${ansi.dim('No scoped tests for #$number '
-        '→ test gate skipped (full suite runs at PR).')}',
-      );
-      return true;
-    }
-    print(
-      '  ${ansi.dim('Scoped tests (${scoped.length}): ${scoped.join(', ')}')}',
-    );
-    return _gate(HarnessPhase.test, ['flutter', 'test', ...scoped], _testLog);
-  }
-
-  void _logGates(
-    int? prd,
-    int? issue, {
-    required bool analyzeOk,
-    required bool testOk,
-  }) {
-    events.event(
-      'ANALYZE',
-      prd: prd,
-      issue: issue,
-      detail: analyzeOk ? 'pass' : 'fail',
-    );
-    events.event(
-      'TEST',
-      prd: prd,
-      issue: issue,
-      detail: testOk ? 'pass' : 'fail',
-    );
-  }
-
-  Future<bool> _gate(
-    HarnessPhase phase,
-    List<String> arguments,
-    String logPath,
-  ) async {
-    _phase(phase);
-    final result = await proc.run('fvm', arguments);
-    File(logPath).writeAsStringSync('${result.stdout}${result.stderr}');
-    final mark = result.ok ? ansi.green('✓ pass') : ansi.red('✗ fail');
-    print('  $mark  fvm ${arguments.join(' ')}');
-    return result.ok;
-  }
-
   Future<void> _maybeOpenPr(int activeParent) async {
+    final analyzeLog = _analyzeLogFor(activeParent);
+    final testLog = _testLogFor(activeParent);
     await git.fetch(config.base);
     final ahead = await git.aheadOf(config.base);
     final openSubs = await _openSubsOf(activeParent);
@@ -998,8 +731,8 @@ class HarnessLoop {
     var analyzeOk = await _gate(HarnessPhase.analyze, [
       'flutter',
       'analyze',
-    ], _analyzeLog);
-    var testOk = await _gate(HarnessPhase.test, ['flutter', 'test'], _testLog);
+    ], analyzeLog);
+    var testOk = await _gate(HarnessPhase.test, ['flutter', 'test'], testLog);
     _logGates(activeParent, null, analyzeOk: analyzeOk, testOk: testOk);
 
     // One holistic review over the whole PRD diff (origin/<base>..HEAD on the
@@ -1021,6 +754,7 @@ class HarnessLoop {
         'PR review #$activeParent',
       );
       _prdCostUsd += r.result?.costUsd ?? 0;
+      _recordCall(CallPhase.prReview, r, prd: activeParent);
       _abortIfFatal(r, 'PR review #$activeParent');
       return r;
     }
@@ -1071,6 +805,12 @@ class HarnessLoop {
         'Review fix #$activeParent',
       );
       _prdCostUsd += fix.result?.costUsd ?? 0;
+      _recordCall(
+        CallPhase.reviewFix,
+        fix,
+        prd: activeParent,
+        model: config.model,
+      );
       _abortIfFatal(fix, 'Review fix #$activeParent');
 
       if (!await git.hasDrift()) {
@@ -1081,15 +821,32 @@ class HarnessLoop {
         break;
       }
       _phase(HarnessPhase.commit, 'PRD #$activeParent fix $round');
-      await git.commitAll(
+      await git.stageAll();
+      final fixLeaks = scanSecrets(await git.stagedDiff());
+      if (fixLeaks.isNotEmpty) {
+        events.event(
+          'SECRET_BLOCK',
+          prd: activeParent,
+          detail: 'review-fix round=$round ${fixLeaks.join('; ')}',
+        );
+        await git.resetHard('HEAD');
+        print(
+          ansi.red(
+            '  Review fix $round added an apparent secret '
+            '(${fixLeaks.join('; ')}) — dropped; leaving the PR for a human.',
+          ),
+        );
+        break;
+      }
+      await git.commitStaged(
         'fix(#$activeParent): address review findings (round $round)\n\n'
         'Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>',
       );
       analyzeOk = await _gate(HarnessPhase.analyze, [
         'flutter',
         'analyze',
-      ], _analyzeLog);
-      testOk = await _gate(HarnessPhase.test, ['flutter', 'test'], _testLog);
+      ], analyzeLog);
+      testOk = await _gate(HarnessPhase.test, ['flutter', 'test'], testLog);
       _logGates(activeParent, null, analyzeOk: analyzeOk, testOk: testOk);
       review = await runReview();
       pass = hasPassVerdict(review.transcript);
@@ -1109,7 +866,8 @@ class HarnessLoop {
     final reviewBody =
         '**AFK PR review (diff-verifier)**\n\n$suiteLine\n\n'
         '${reviewComment(review.transcript)}$reviewSummary'
-        '${_manualSection(review.transcript)}'
+        '${manualSection(review.transcript)}'
+        '${structuralSection(review.transcript)}'
         '\n\n_Total AFK spend for PRD #$activeParent: '
         '\$${_prdCostUsd.toStringAsFixed(4)}._';
     final green = analyzeOk && testOk && pass;
@@ -1121,10 +879,70 @@ class HarnessLoop {
     await gh.commentOnPr(url, reviewBody);
 
     if (green) {
-      await gh.markPrReady(url);
-      events.event('PR_READY', prd: activeParent, detail: 'url=$url');
-      print('  ${ansi.green('✓ Full suite + review PASS → $url ready.')}');
-      return;
+      // The local gates and review are green; the PR was opened as a draft.
+      // Unless watching is off, follow its remote CI to a conclusion before
+      // marking it ready — a build green on `fvm flutter` here can still fail
+      // the PR's GitHub Actions (a different OS, golden tests, integration
+      // suites, codegen). CI failures are fed back to a fixer up to
+      // config.maxCiFixes rounds; a repo with no checks auto-skips the wait.
+      if (!config.watchCi) {
+        await gh.markPrReady(url);
+        events.event('PR_READY', prd: activeParent, detail: 'url=$url ci=off');
+        print('  ${ansi.green('✓ Full suite + review PASS → $url ready.')}');
+        return;
+      }
+      final outcome = await _watchCi(
+        activeParent,
+        title,
+        url,
+        canonical,
+        analyzeLog: analyzeLog,
+        testLog: testLog,
+      );
+      switch (outcome) {
+        case _CiOutcome.ready:
+        case _CiOutcome.noCi:
+          await gh.markPrReady(url);
+          final note = outcome == _CiOutcome.noCi
+              ? 'no remote CI — ready off local verdict'
+              : 'remote CI green';
+          events.event(
+            'PR_READY',
+            prd: activeParent,
+            detail: 'url=$url ci=${outcome.name}',
+          );
+          print(
+            '  ${ansi.green('✓ Full suite + review PASS, $note → $url '
+            'ready.')}',
+          );
+          return;
+        case _CiOutcome.failed:
+        case _CiOutcome.timedOut:
+          traces.append(
+            TraceRecord(
+              ts: DateTime.now().toIso8601String(),
+              prd: activeParent,
+              lane: _prdLane[activeParent] ?? RiskLane.normal,
+              outcome: 'draft',
+              attempts: 1,
+              frictions: const [FrictionKind.ciFail],
+            ),
+          );
+          await gh.markPrDraft(url);
+          events.event(
+            'PR_DRAFT',
+            prd: activeParent,
+            detail: 'url=$url ci=${outcome.name}',
+          );
+          print(
+            ansi.red(
+              '  ✗ $url left as draft '
+              '(local gates + review green, but remote CI '
+              '${outcome == _CiOutcome.timedOut ? 'did not settle in time' : 'stayed red'}).',
+            ),
+          );
+          return;
+      }
     }
 
     // Red gate or rejected review: demote to draft (a prior run may have marked
@@ -1158,6 +976,137 @@ class HarnessLoop {
     );
   }
 
+  /// Watches the just-opened (draft) PR's remote CI to a conclusion, auto-fixing
+  /// failures up to [Config.maxCiFixes] rounds. The local gates and the review
+  /// are already green; this is the remote backstop a `fvm flutter` build cannot
+  /// see (a different OS, golden tests, integration suites, codegen). Polling
+  /// backs off (30s → 60s → 120s via [ciPollInterval]) with a 60s grace before
+  /// trusting an empty rollup, so a PR whose checks have not registered yet is
+  /// not mistaken for one with no CI. Returns:
+  ///
+  /// - [_CiOutcome.ready]    CI passed and the branch is not in conflict.
+  /// - [_CiOutcome.noCi]     no checks after the grace — caller marks ready.
+  /// - [_CiOutcome.failed]   CI stayed red past the fix budget, a fix regressed
+  ///                         the local gates / produced no change / leaked a
+  ///                         secret, the push failed, or the branch conflicts.
+  /// - [_CiOutcome.timedOut] CI never settled within [Config.ciTimeout].
+  Future<_CiOutcome> _watchCi(
+    int activeParent,
+    String title,
+    String url,
+    String branch, {
+    required String analyzeLog,
+    required String testLog,
+  }) async {
+    _phase(HarnessPhase.pr, 'CI watch — PR #$activeParent');
+    final start = DateTime.now();
+    final deadline = start.add(config.ciTimeout);
+    // A PR opened seconds ago may report no checks yet; only conclude "no CI"
+    // after this grace. A fix push extends it (the new commit's run must
+    // register), so a freshly-pushed head is never misread as no-CI.
+    var graceUntil = start.add(const Duration(seconds: 60));
+    var fixes = 0;
+
+    while (true) {
+      final status = await gh.prCiStatus(url);
+      switch (status.state) {
+        case CiState.passing:
+          // A branch that conflicts with base cannot merge regardless of CI, so
+          // that is a human's call — leave it a draft rather than ready.
+          if (status.mergeable == false) {
+            events.event('CI_CONFLICT', prd: activeParent, detail: 'url=$url');
+            print(
+              ansi.red(
+                '  remote CI passed but the branch conflicts with '
+                '${config.base} — leaving draft for a human.',
+              ),
+            );
+            return _CiOutcome.failed;
+          }
+          events.event('CI_PASS', prd: activeParent, detail: 'url=$url');
+          print('  ${ansi.green('✓ remote CI passed.')}');
+          return _CiOutcome.ready;
+
+        case CiState.none:
+          if (DateTime.now().isAfter(graceUntil)) {
+            events.event('CI_NONE', prd: activeParent, detail: 'url=$url');
+            print(ansi.dim('  No remote CI on this PR — skipping the watch.'));
+            return _CiOutcome.noCi;
+          }
+
+        case CiState.pending:
+          break;
+
+        case CiState.failing:
+          if (fixes >= config.maxCiFixes) {
+            events.event(
+              'CI_FAIL',
+              prd: activeParent,
+              detail: 'url=$url fixes=$fixes/${config.maxCiFixes} exhausted',
+            );
+            print(
+              ansi.red(
+                '  ✗ remote CI still failing after ${config.maxCiFixes} '
+                'fix round(s).',
+              ),
+            );
+            await _commentCiHandoff(
+              url,
+              'remote CI still failed after ${config.maxCiFixes} auto-fix '
+              'round(s)',
+            );
+            return _CiOutcome.failed;
+          }
+          fixes++;
+          final fixed = await _runCiFix(
+            activeParent,
+            title,
+            url,
+            branch,
+            status.failedRunIds,
+            fixes,
+            analyzeLog: analyzeLog,
+            testLog: testLog,
+          );
+          if (!fixed) {
+            await _commentCiHandoff(
+              url,
+              'a CI auto-fix could not be applied cleanly (no change, a local '
+              'gate regression, an apparent secret, or a push failure)',
+            );
+            return _CiOutcome.failed;
+          }
+          // The fix is pushed; the new commit's CI needs to register. Reset the
+          // grace so the next poll waits out the queueing run, not the stale
+          // failed one.
+          graceUntil = DateTime.now().add(const Duration(seconds: 60));
+      }
+
+      if (DateTime.now().isAfter(deadline)) {
+        events.event(
+          'CI_TIMEOUT',
+          prd: activeParent,
+          detail: 'url=$url after=${config.ciTimeout.inMinutes}m',
+        );
+        print(
+          ansi.red(
+            '  ✗ remote CI did not settle within ${config.ciTimeout.inMinutes}m '
+            '— leaving draft for a human.',
+          ),
+        );
+        await _commentCiHandoff(
+          url,
+          'remote CI did not settle within ${config.ciTimeout.inMinutes} '
+          'minutes',
+        );
+        return _CiOutcome.timedOut;
+      }
+      await Future<void>.delayed(
+        ciPollInterval(DateTime.now().difference(start)),
+      );
+    }
+  }
+
   /// Pushes [branch] and opens the single whole-PRD PR — or reuses the one that
   /// already tracks [branch], so a re-run updates the existing PR in place
   /// instead of opening a duplicate. Returns the PR url, or null on push/create
@@ -1185,7 +1134,8 @@ class HarnessLoop {
       body:
           'Implemented by the AFK loop for PRD #$activeParent.\n\n'
           'Each sub-issue passed analyze + tests before landing.\n\n'
-          'AFK implement spend: \$${_prdCostUsd.toStringAsFixed(4)}.\n\n'
+          'AFK implement spend: \$${_prdCostUsd.toStringAsFixed(4)}.'
+          '${_gateEvidence(activeParent)}\n\n'
           'Closes #$activeParent\n\n'
           '🤖 Generated with [Claude Code](https://claude.com/claude-code)',
     );
@@ -1198,39 +1148,40 @@ class HarnessLoop {
     return prUrl;
   }
 
-  /// Renders the reviewer's manual-verification notes as an unchecked checklist
-  /// for the human reviewing the draft PR, or '' when there are none. These are
-  /// acceptance criteria the autonomous gates cannot settle from the diff (UI,
-  /// real-device perf, external-service behavior) — surfaced, never gated on.
-  String _manualSection(String transcript) {
-    final notes = manualNotes(transcript);
-    if (notes.isEmpty) return '';
-    final items = notes.map((n) => '- [ ] $n').join('\n');
-    return '\n\n## Manual verification (needs a human)\n$items';
-  }
+  /// Reads the PRD's analyze + test log tails and renders them via the pure
+  /// [gateEvidence] for the PR description. The FS read stays here; the wording
+  /// is unit-tested in `pr_comments.dart`.
+  String _gateEvidence(int parent) => gateEvidence([
+    for (final (label, path) in [
+      ('analyze', _analyzeLogFor(parent)),
+      ('test', _testLogFor(parent)),
+    ])
+      if (File(path).existsSync()) (label, _tail(path, 15)),
+  ]);
 
+  /// Reads the failing analyze/test log tails and renders the handoff via the
+  /// pure [failComment]. The FS read stays here; the wording is unit-tested.
   String _failComment(
     int number, {
     required bool analyzeOk,
     required bool testOk,
+    required String analyzeLog,
+    required String testLog,
     String implementSummary = '',
     bool contextStarved = false,
   }) {
     final logs = [
-      for (final path in [_analyzeLog, _testLog])
+      for (final path in [analyzeLog, testLog])
         if (File(path).existsSync()) '==> $path <==\n${_tail(path, 20)}',
     ].join('\n\n');
-    final starvedNote = contextStarved
-        ? '\n\n⚠️ The implementer ran low on context (<15% free) before '
-              'failing — this slice is likely too large. Consider splitting it '
-              'into smaller sub-issues.'
-        : '';
-    return 'AFK verify FAILED '
-        '(analyze=${analyzeOk ? 1 : 0} test=${testOk ? 1 : 0}).'
-        '$implementSummary\n\n'
-        'Failed attempt preserved at tag `ralph-fail/$number` '
-        '(recover with `git checkout ralph-fail/$number`).\n\n'
-        '**Logs**\n```\n$logs\n```$starvedNote';
+    return failComment(
+      number,
+      analyzeOk: analyzeOk,
+      testOk: testOk,
+      logs: logs,
+      implementSummary: implementSummary,
+      contextStarved: contextStarved,
+    );
   }
 
   String _tail(String path, int count) {

@@ -53,17 +53,20 @@ class PromptLibrary {
     required PromptTemplate prVerifier,
     required PromptTemplate intake,
     required PromptTemplate fixer,
+    required PromptTemplate ciFixer,
   }) : _implementer = implementer,
        _verifier = verifier,
        _prVerifier = prVerifier,
        _intake = intake,
-       _fixer = fixer;
+       _fixer = fixer,
+       _ciFixer = ciFixer;
 
   final PromptTemplate _implementer;
   final PromptTemplate _verifier;
   final PromptTemplate _prVerifier;
   final PromptTemplate _intake;
   final PromptTemplate _fixer;
+  final PromptTemplate _ciFixer;
 
   static const _implementerVars = {
     'PRD_CONTEXT',
@@ -107,6 +110,7 @@ class PromptLibrary {
     'BASE',
     'FINDINGS',
   };
+  static const _ciFixerVars = {'PARENT_NUMBER', 'PARENT_TITLE', 'BASE', 'LOGS'};
 
   static Future<PromptLibrary> load({Directory? repoRoot}) async {
     final root = repoRoot ?? Directory.current;
@@ -116,6 +120,7 @@ class PromptLibrary {
       prVerifier: await _resolve('pr-verifier', root, _prVerifierVars),
       intake: await _resolve('intake', root, _intakeVars),
       fixer: await _resolve('fixer', root, _fixerVars),
+      ciFixer: await _resolve('ci-fixer', root, _ciFixerVars),
     );
   }
 
@@ -278,6 +283,18 @@ class PromptLibrary {
     'PARENT_TITLE': title,
     'BASE': base,
     'FINDINGS': findings.isEmpty ? '(no findings captured)' : findings,
+  });
+
+  String ciFixer(
+    int parent,
+    String title,
+    String base, {
+    required String logs,
+  }) => _ciFixer.render({
+    'PARENT_NUMBER': '$parent',
+    'PARENT_TITLE': title,
+    'BASE': base,
+    'LOGS': logs.isEmpty ? '(no failed-job logs captured)' : logs,
   });
 
   String intake({required Issue issue, String prdContext = ''}) {

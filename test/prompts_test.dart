@@ -22,13 +22,14 @@ You are an expert Flutter/Dart engineer. Implement the issue above, end to end, 
 <orient>
 - Read the issue description and every comment. Treat the comments as authoritative refinements of the description where they differ.
 - This issue is ONE slice of a larger PRD (see the PRD context and the sibling slices above). Before changing anything, reconcile your slice's shared interfaces — field names and their meaning, route parameters, provider/cubit scopes — with the PRD intent, the sibling slices listed, and the slices already implemented in the codebase. A value the PRD requires to be consistent (e.g. a headline metric) must read the same source field everywhere; an interface a sibling slice will consume must already carry the parameters that slice needs.
-- Restate the acceptance criteria to yourself as a concrete checklist. That checklist is your definition of done.
+- Break the acceptance criteria into a concrete task checklist using your task-tracking tool (`TaskCreate`; fall back to `TodoWrite` on older CLIs). That checklist is your single source of truth for "done".
 - Stay strictly inside THIS slice's acceptance criteria: do NOT implement what a sibling slice (listed above) owns, and make no changes outside this slice's scope — no opportunistic refactors of adjacent code.
 - Use the Explore agent to locate the relevant code before changing anything — do not guess at file locations. Then find the closest existing slice or feature in the repo and mirror its structure — naming, file layout, cubit/provider wiring: prefer mirroring a proven pattern over inventing a new one.
 - If the task touches a domain topic (websocket, streaming, widgets, approval, history, etc.), delegate to the domain-doc-researcher agent first and honor the constraints it returns.
 </orient>
 
 <implement>
+- Mark each task `in_progress` as you start it and `completed` the moment its code is written and its local check passes — update the checklist as you go, do not batch the updates at the end. The open tasks are what still stands between you and done.
 - Prefer retrieval-led reasoning over pre-training-led reasoning for all Flutter/Dart work: confirm APIs and patterns against the actual code, not from memory.
 - Match the conventions of the surrounding code — naming, structure, error handling, and idioms.
 - Ship FULL implementations only. NEVER leave placeholders, stubs, TODOs, or commented-out code.
@@ -90,10 +91,11 @@ You are reviewing the FULL pull request for PRD #$parent: $title.
 
 ## How to review
 Run your **Mode B** full-pull-request pipeline from your agent instructions, end
-to end: triage, the five-lens independent panel, per-issue confidence scoring,
-the under-80 filter, then the cited review comment. This is read-only — do NOT
-edit any file. Cite each surviving issue with a permalink under $repo built
-from the full `git rev-parse HEAD` SHA.
+to end: triage, the six-lens independent panel (including the whole-diff
+structural lens), per-issue confidence scoring, the under-80 filter, then the
+cited review comment. This is read-only — do NOT edit any file. Cite each
+surviving issue with a permalink under $repo built from the full
+`git rev-parse HEAD` SHA.
 
 Judge the PRD as a whole: the slices must fit together with no contradictions or integration gaps, and satisfy the PRD's intent. FAIL only for the blocking
 problems your instructions define; report surviving nits as non-blocking notes.
@@ -104,6 +106,16 @@ Some acceptance criteria cannot be settled from the diff alone — UI/UX, real-d
 MANUAL: <the criterion restated as one concrete check a human can perform>
 
 These never affect your verdict — they tell the human reviewing this draft PR what still needs eyes. Emit nothing here if every criterion is verifiable from the diff and the gates.
+
+## Maintainability (surface, never gate)
+The structural lens sees the whole assembled PRD — the only place to catch logic two slices each reinvented, a branch or wrapper that could collapse, incidental complexity a simpler path removes. Emit each such subjective simplification as one line BEFORE your `### Code review` comment:
+
+STRUCTURAL: <what could disappear and why the result is simpler, in one sentence>
+
+These never affect your verdict — the objective CLAUDE.md-rule violations that *do* gate ride the verdict instead. Emit nothing if there is no simplification worth a human's time.
+
+## Evidence checkpoint (before the verdict)
+Before the verdict line, pass over every issue you are about to let FAIL this PR and, for each, name the concrete evidence in the diff that makes it blocking: the exact changed line, the symptom, and why the diff — not a guess about runtime — proves it. A claim you cannot ground in a changed line is not a FAIL: re-cast it as a `MANUAL:` line if it depends on UI/runtime, or drop it if it is mere suspicion. Only diff-grounded issues may decide the verdict.
 
 ## Verdict
 End your response with exactly one line and nothing after it: either `VERDICT: PASS` or `VERDICT: FAIL`.''';
@@ -322,6 +334,26 @@ void main() {
           prRef: 'https://github.com/octo/app/pull/7',
         ).trim(),
       );
+    });
+
+    test('ci-fixer renders the parent header and the failed logs', () async {
+      final lib = await defaults();
+      final out = lib.ciFixer(
+        42,
+        'My PRD',
+        'dev',
+        logs: 'FAILED: golden mismatch in home_test.dart',
+      );
+      expect(out, contains('## PRD #42: My PRD'));
+      expect(out, contains('origin/dev..HEAD'));
+      expect(out, contains('FAILED: golden mismatch in home_test.dart'));
+      expect(out, contains('Do NOT commit and do NOT run git'));
+    });
+
+    test('ci-fixer falls back when no logs were captured', () async {
+      final lib = await defaults();
+      final out = lib.ciFixer(1, 'PRD', 'main', logs: '');
+      expect(out, contains('(no failed-job logs captured)'));
     });
   });
 

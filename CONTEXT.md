@@ -63,7 +63,9 @@ The outcome of a Claude review run over a diff. Parsed from the review output to
    - Parse Claude review output to detect PASS/FAIL verdicts
    - Determine if a diff is approved
 
-7. **Main Loop** (`loop.dart`)
+7. **Main Loop** (`loop.dart` + `slice_runner.dart` / `worker_pool.dart` / `ci_watcher.dart`)
+   - One `HarnessLoop` class split across `part of 'loop.dart'` files; the
+     sequential and parallel drives share one `_runSlice` behind a `_SliceIo` seam
    - Orchestrates the per-PRD workflow:
      1. Find highest-priority processable sub-issue
      2. Checkout branch
@@ -123,7 +125,16 @@ See `test/` directory.
 - **Deterministic retries** — failed issues tagged (`ralph-fail/<n>`), rolled back, relabeled for human review
 - **Single PR per PRD** — all sub-issues in a PRD are collected into one branch/PR
 - **Base branch configurable** — default `dev`; set via `--base` or `BASE` env var
-- **Model configurable** — default `opus`; set via `--model` or `MODEL` env var
+- **Model tiered by risk lane** — `--model`/`MODEL` (default `opus`) is the top
+  implementer model and escalation ceiling; the slice implementer opens tiny/
+  normal slices on Sonnet, high-risk on Opus, and climbs one rung per failed
+  retry up to the ceiling (`model_ladder.dart`)
+- **Cost ledger** — every completed `claude` call appends a `CallRecord` (phase,
+  model, cost/turns/duration, outcome) to the durable, git-excluded
+  `.dartralph/calls.jsonl` (`call_log.dart`); at each run exit the harness prints
+  a cost report split by phase and model plus an estimated lane-tiering saving.
+  Purely observability — the spend data the transcript otherwise discards, made
+  analyzable after the fact
 - **Dry-run mode** — prints PRD/sub-issue order without making changes
 - **Issue number filter** — `--issue N` processes only issue N, then exits
 - **One-shot mode** — `--once` processes exactly one sub-issue, then exits

@@ -125,6 +125,61 @@ void main() {
     });
   });
 
+  group('eligibleSlices', () {
+    Issue issue(int number, String body, [List<String> labels = const []]) =>
+        Issue(number: number, title: 't', body: body, labels: labels, url: 'u');
+
+    test('a slice is eligible only when every blocker is satisfied', () {
+      final ready = [
+        issue(10, '## Blocked by\n#9\n'),
+        issue(11, '## Blocked by\nNone\n'),
+      ];
+      // #9 is not satisfied → #10 is blocked; #11 has no blockers → eligible.
+      expect(
+        eligibleSlices(ready, satisfied: {}, excluded: {}).map((i) => i.number),
+        [11],
+      );
+      // Once #9 is satisfied, #10 unblocks too (ordered by number, same tier).
+      expect(
+        eligibleSlices(
+          ready,
+          satisfied: {9},
+          excluded: {},
+        ).map((i) => i.number),
+        [10, 11],
+      );
+    });
+
+    test('umbrellas and excluded issues are never scheduled', () {
+      final ready = [
+        issue(100, 'PRD spec, no Parent'), // umbrella: #101 declares it parent
+        issue(101, '## Parent\n#100\n'),
+        issue(102, '## Parent\n#100\n'),
+      ];
+      // #100 dropped as umbrella; #101 excluded (in flight) → only #102 left.
+      expect(
+        eligibleSlices(
+          ready,
+          satisfied: {},
+          excluded: {101},
+        ).map((i) => i.number),
+        [102],
+      );
+    });
+
+    test('orders eligible slices by priority then number', () {
+      final ready = [
+        issue(30, 'no blockers'),
+        issue(20, 'no blockers', ['critical']),
+        issue(10, 'no blockers'),
+      ];
+      expect(
+        eligibleSlices(ready, satisfied: {}, excluded: {}).map((i) => i.number),
+        [20, 10, 30],
+      );
+    });
+  });
+
   group('slugify', () {
     test('lowercases and replaces runs of non-alphanumerics with one dash', () {
       expect(slugify('Fix: WebSocket reconnect!!'), 'fix-websocket-reconnect');

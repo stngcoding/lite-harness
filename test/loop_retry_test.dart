@@ -75,7 +75,11 @@ class FakeGit extends GitOps {
   @override
   Future<bool> hasDrift() async => true;
   @override
-  Future<bool> commitAll(String message) async {
+  Future<void> stageAll() async {}
+  @override
+  Future<String> stagedDiff() async => '';
+  @override
+  Future<bool> commitStaged(String message) async {
     commits++;
     return true;
   }
@@ -127,7 +131,11 @@ class FailingProc extends ProcessRunner {
   int failAnalyze;
 
   @override
-  Future<ProcResult> run(String executable, List<String> arguments) async {
+  Future<ProcResult> run(
+    String executable,
+    List<String> arguments, {
+    String? workingDirectory,
+  }) async {
     if (arguments.contains('analyze') && failAnalyze > 0) {
       failAnalyze--;
       return const ProcResult(1, 'ANALYZE BOOM', '');
@@ -146,6 +154,7 @@ PromptLibrary _prompts() => PromptLibrary(
   prVerifier: PromptTemplate('pr-verifier', 'p', const {}),
   intake: PromptTemplate('intake', 'i', const {}),
   fixer: PromptTemplate('fixer', 'fix {{FINDINGS}}', const {'FINDINGS'}),
+  ciFixer: PromptTemplate('ci-fixer', 'ci {{LOGS}}', const {'LOGS'}),
 );
 
 Config _config({required int maxAttempts}) => Config(
@@ -156,6 +165,8 @@ Config _config({required int maxAttempts}) => Config(
   dryRun: false,
   issueNumber: 9,
   maxAttempts: maxAttempts,
+  concurrency: 1,
+  watchCi: false,
 );
 
 HarnessLoop _loop(

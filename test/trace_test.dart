@@ -52,6 +52,28 @@ void main() {
       expect(TraceRecord.parse(noSig.toJsonLine()).signature, isNull);
     });
 
+    test('round-trips the model field and omits it when null', () {
+      const withModel = TraceRecord(
+        ts: 't',
+        lane: RiskLane.normal,
+        outcome: 'pass',
+        attempts: 2,
+        frictions: [],
+        model: 'opus',
+      );
+      expect(TraceRecord.parse(withModel.toJsonLine()).model, 'opus');
+
+      const noModel = TraceRecord(
+        ts: 't',
+        lane: RiskLane.tiny,
+        outcome: 'pass',
+        attempts: 1,
+        frictions: [],
+      );
+      expect(noModel.toJsonLine(), isNot(contains('model')));
+      expect(TraceRecord.parse(noModel.toJsonLine()).model, isNull);
+    });
+
     test('omits null issue/prd/detail and parses them back as null', () {
       const record = TraceRecord(
         ts: '2026-06-18T08:00:00.000',

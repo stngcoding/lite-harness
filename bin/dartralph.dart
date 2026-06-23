@@ -25,7 +25,13 @@ ArgParser _buildParser() => ArgParser()
     help: 'Issue state filter (default: open, env STATE).',
   )
   ..addOption('base', help: 'PR base branch (default: dev, env BASE).')
-  ..addOption('model', help: 'Implementer model (default: opus, env MODEL).')
+  ..addOption(
+    'model',
+    help:
+        'Top implementer model / escalation ceiling (default: opus, env '
+        'MODEL). Cheap lanes start on Sonnet and climb toward this on retries; '
+        'lowering it caps every lane at or below it.',
+  )
   ..addOption(
     'issue',
     abbr: 'n',
@@ -47,6 +53,32 @@ ArgParser _buildParser() => ArgParser()
     help:
         'Skip the implement loop and only review this PR (number or URL): full '
         'suite + diff-verifier, comment the verdict, mark ready if green.',
+  )
+  ..addOption(
+    'concurrency',
+    help:
+        'How many sub-issues to implement in parallel, each in its own git '
+        'worktree (default: 2, max 4, env CONCURRENCY). 1 = sequential.',
+  )
+  ..addOption(
+    'max-ci-fixes',
+    help:
+        'After a PR opens, feed its CI failures back to a fixer up to N times '
+        'before leaving the PR a draft (default: 3, env MAX_CI_FIXES).',
+  )
+  ..addOption(
+    'ci-timeout',
+    help:
+        'Minutes to watch a PR\'s CI before leaving it a draft for a human '
+        '(default: 30, env CI_TIMEOUT_MINS).',
+  )
+  ..addFlag(
+    'watch-ci',
+    defaultsTo: true,
+    help:
+        'After opening a PR whose local gates + review are green, watch its '
+        'remote CI to conclusion and auto-fix failures before marking it ready '
+        '(env WATCH_CI=0 to disable). A PR with no CI auto-skips the wait.',
   )
   ..addFlag(
     'once',
@@ -139,6 +171,53 @@ Future<void> _run(List<String> arguments, String debugLogPath) async {
     maxAttempts = parsed;
   }
 
+  final concurrencyArg =
+      options['concurrency'] as String? ?? env['CONCURRENCY'];
+  var concurrency = 2;
+  if (concurrencyArg != null) {
+    final parsed = int.tryParse(concurrencyArg);
+    if (parsed == null || parsed < 1 || parsed > 4) {
+      stderr.writeln('--concurrency expects 1..4, got "$concurrencyArg".');
+      exit(64);
+    }
+    concurrency = parsed;
+  }
+
+  final maxCiFixesArg =
+      options['max-ci-fixes'] as String? ?? env['MAX_CI_FIXES'];
+  var maxCiFixes = 3;
+  if (maxCiFixesArg != null) {
+    final parsed = int.tryParse(maxCiFixesArg);
+    if (parsed == null || parsed < 0) {
+      stderr.writeln(
+        '--max-ci-fixes expects a non-negative integer, got "$maxCiFixesArg".',
+      );
+      exit(64);
+    }
+    maxCiFixes = parsed;
+  }
+
+  final ciTimeoutArg =
+      options['ci-timeout'] as String? ?? env['CI_TIMEOUT_MINS'];
+  var ciTimeout = const Duration(minutes: 30);
+  if (ciTimeoutArg != null) {
+    final parsed = int.tryParse(ciTimeoutArg);
+    if (parsed == null || parsed < 1) {
+      stderr.writeln(
+        '--ci-timeout expects a positive integer (minutes), got '
+        '"$ciTimeoutArg".',
+      );
+      exit(64);
+    }
+    ciTimeout = Duration(minutes: parsed);
+  }
+
+  // --watch-ci defaults true; WATCH_CI=0/false disables it without a flag.
+  final watchCiEnv = env['WATCH_CI'];
+  final watchCi = watchCiEnv == null
+      ? options['watch-ci'] as bool
+      : !(watchCiEnv == '0' || watchCiEnv.toLowerCase() == 'false');
+
   final ansi = Ansi.forStdout();
   final proc = ProcessRunner();
   final repo =
@@ -161,6 +240,10 @@ Future<void> _run(List<String> arguments, String debugLogPath) async {
     issueNumber: issueNumber,
     maxAttempts: maxAttempts,
     reviewPr: options['review-pr'] as String?,
+    concurrency: concurrency,
+    watchCi: watchCi,
+    maxCiFixes: maxCiFixes,
+    ciTimeout: ciTimeout,
   );
 
   final PromptLibrary prompts;
@@ -196,6 +279,7 @@ Future<void> _run(List<String> arguments, String debugLogPath) async {
   print('Base:  ${config.base}');
   print('Debug log:  $debugLogPath');
   if (!config.dryRun) print('Events log: $eventsLogPath');
+  if (!config.dryRun) print('Cost log:   $callLogPath');
   print('');
 
   final loop = HarnessLoop(

@@ -167,7 +167,11 @@ class FakeGit extends GitOps {
   @override
   Future<bool> hasDrift() async => drift;
   @override
-  Future<bool> commitAll(String message) async {
+  Future<void> stageAll() async {}
+  @override
+  Future<String> stagedDiff() async => '';
+  @override
+  Future<bool> commitStaged(String message) async {
     commits.add(message);
     return true;
   }
@@ -245,8 +249,11 @@ class FakeClaude extends ClaudeRunner {
 
 class FakeProc extends ProcessRunner {
   @override
-  Future<ProcResult> run(String executable, List<String> arguments) async =>
-      const ProcResult(0, '', '');
+  Future<ProcResult> run(
+    String executable,
+    List<String> arguments, {
+    String? workingDirectory,
+  }) async => const ProcResult(0, '', '');
 }
 
 PromptLibrary _prompts() => PromptLibrary(
@@ -257,6 +264,7 @@ PromptLibrary _prompts() => PromptLibrary(
   prVerifier: PromptTemplate('pr-verifier', 'p', const {}),
   intake: PromptTemplate('intake', 'i', const {}),
   fixer: PromptTemplate('fixer', 'fix {{FINDINGS}}', const {'FINDINGS'}),
+  ciFixer: PromptTemplate('ci-fixer', 'ci {{LOGS}}', const {'LOGS'}),
 );
 
 const _config = Config(
@@ -265,6 +273,8 @@ const _config = Config(
   base: 'dev',
   model: 'sonnet',
   dryRun: false,
+  concurrency: 1,
+  watchCi: false,
 );
 
 HarnessLoop _loop(

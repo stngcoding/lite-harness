@@ -27,6 +27,17 @@ How to work:
 - Flag real, substantive problems through your lens. Be conservative: a separate
   scoring pass will judge confidence, so do not pad the list with nitpicks.
 
+If your lens is **structural**, simplification and structure ARE your job, not
+nitpicks — read the assembled diff as one whole and tag each candidate `kind:`:
+- `kind: hard-rule` — an objective rule a relevant CLAUDE.md states outright,
+  visible only in the whole: a file the combined change pushes past the doc's
+  stated max length, or the same logic two slices each reinvented where the doc
+  requires canonical reuse.
+- `kind: simplification` — a subjective "code judo" win: a branch, mode,
+  conditional, wrapper, or layer the change could make disappear; incidental
+  complexity a simpler path removes.
+For every other lens, omit `kind` and do not flag pure structure/simplification.
+
 Do NOT flag (these are false positives):
 - Anything a linter, type checker, compiler, or the test run would catch. Do not
   run builds; assume they run separately.
@@ -43,6 +54,7 @@ one block per candidate issue:
 - title: <one line>
   file: <path>:<line>
   lens: <your lens>
+  kind: <hard-rule|simplification — structural lens only; omit otherwise>
   why: <why it is a problem; quote the CLAUDE.md/comment/snippet if relevant>
 ```
 

@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'ansi.dart';
 import 'claude_stream.dart';
 import 'proc.dart';
@@ -83,10 +85,21 @@ int contextWindowFor(String model) => _contextWindows[model] ?? 200000;
 const _contextWindows = <String, int>{};
 
 class ClaudeRunner {
-  ClaudeRunner(this._proc, {Ansi? ansi}) : _ansi = ansi ?? Ansi.forStdout();
+  ClaudeRunner(this._proc, {Ansi? ansi, this.workingDirectory, this.logSink})
+    : _ansi = ansi ?? Ansi.forStdout();
 
   final ProcessRunner _proc;
   final Ansi _ansi;
+
+  /// The repo a `claude` run executes in. `null` = the harness process's cwd; a
+  /// parallel worker passes its per-issue worktree path so the agent edits that
+  /// tree in isolation.
+  final String? workingDirectory;
+
+  /// When set, the live transcript is written here instead of stdout — a
+  /// parallel worker routes its agent output to a per-issue log file so the
+  /// console stays free for the multi-worker dashboard.
+  final IOSink? logSink;
 
   Future<ClaudeRun> implement({
     required String model,
@@ -130,8 +143,17 @@ class ClaudeRunner {
     List<String> arguments, {
     int contextWindow = 200000,
   }) async {
-    final renderer = StreamRenderer(ansi: _ansi, contextWindow: contextWindow);
-    await _proc.stream('claude', arguments, onLine: renderer.onLine);
+    final renderer = StreamRenderer(
+      sink: logSink,
+      ansi: _ansi,
+      contextWindow: contextWindow,
+    );
+    await _proc.stream(
+      'claude',
+      arguments,
+      onLine: renderer.onLine,
+      workingDirectory: workingDirectory,
+    );
     return ClaudeRun(
       transcript: renderer.transcript,
       result: renderer.result,

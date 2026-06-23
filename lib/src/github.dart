@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'ci_status.dart';
 import 'context_budget.dart';
 import 'issue.dart';
 import 'proc.dart';
@@ -288,6 +289,54 @@ class GhCli {
   /// previously-green PR out of review when a later re-run regresses it.
   Future<void> markPrDraft(String ref) =>
       _quiet(['pr', 'ready', ref, '--repo', repo, '--undo']);
+
+  /// The aggregate CI verdict for [ref] (a PR number or URL): check-run rollup
+  /// plus base-mergeability. A failed `gh` call or unparseable payload degrades
+  /// to [CiState.none], so the final phase treats it as "no CI to wait on"
+  /// rather than blocking forever on a transient `gh` hiccup.
+  Future<CiStatus> prCiStatus(String ref) async {
+    final result = await _proc.run('gh', [
+      'pr',
+      'view',
+      ref,
+      '--repo',
+      repo,
+      '--json',
+      'statusCheckRollup,mergeable',
+    ]);
+    if (!result.ok) return const CiStatus(state: CiState.none);
+    return parseCiStatus(result.stdout);
+  }
+
+  /// The failed-step logs for each Actions run in [runIds] (`gh run view
+  /// --log-failed`), each clamped to its last [tailLines] lines and labeled by
+  /// run id. This is what the CI fixer reads to find the root cause. Runs whose
+  /// logs cannot be fetched are skipped, never fatal.
+  Future<String> ciFailedLogs(List<int> runIds, {int tailLines = 200}) async {
+    final blocks = <String>[];
+    for (final id in runIds) {
+      final result = await _proc.run('gh', [
+        'run',
+        'view',
+        '$id',
+        '--repo',
+        repo,
+        '--log-failed',
+      ]);
+      final out = result.stdout.trim();
+      if (out.isEmpty) continue;
+      blocks.add(
+        '# Actions run $id — failed steps\n${_tailLines(out, tailLines)}',
+      );
+    }
+    return blocks.join('\n\n');
+  }
+
+  static String _tailLines(String text, int count) {
+    final lines = text.split('\n');
+    if (lines.length <= count) return text;
+    return lines.sublist(lines.length - count).join('\n');
+  }
 
   /// Closes any open PR whose head is a leftover stacked-PR chunk branch for
   /// [parent] (`<parent>-chunk-…`). The harness no longer splits PRDs, so these

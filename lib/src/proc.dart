@@ -12,8 +12,16 @@ class ProcResult {
 }
 
 class ProcessRunner {
-  Future<ProcResult> run(String executable, List<String> arguments) async {
-    final result = await Process.run(executable, arguments);
+  Future<ProcResult> run(
+    String executable,
+    List<String> arguments, {
+    String? workingDirectory,
+  }) async {
+    final result = await Process.run(
+      executable,
+      arguments,
+      workingDirectory: workingDirectory,
+    );
     return ProcResult(
       result.exitCode,
       result.stdout as String,
@@ -25,8 +33,13 @@ class ProcessRunner {
     String executable,
     List<String> arguments, {
     required void Function(String line) onLine,
+    String? workingDirectory,
   }) async {
-    final process = await Process.start(executable, arguments);
+    final process = await Process.start(
+      executable,
+      arguments,
+      workingDirectory: workingDirectory,
+    );
     final stderrDone = process.stderr
         .transform(utf8.decoder)
         .forEach(stderr.write);
