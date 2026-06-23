@@ -42,10 +42,10 @@ class PromptTemplate {
       body.replaceAllMapped(_placeholder, (m) => vars[m.group(1)] ?? '');
 }
 
-/// Resolves and renders the harness's three prompts. Each prompt is loaded
-/// from `.dartralph/prompts/<name>.md` in the target repo if present, else
-/// from the default shipped inside this package. Construction validates every
-/// template, so [load] throwing means a prompt is malformed.
+/// Resolves and renders the harness's prompts. Each loads from
+/// `.dartralph/prompts/<name>.md` in the target repo if present, else the
+/// default shipped in this package. Construction validates every template, so
+/// [load] throwing means a prompt is malformed.
 class PromptLibrary {
   PromptLibrary({
     required PromptTemplate implementer,
@@ -180,10 +180,9 @@ class PromptLibrary {
     });
   }
 
-  /// The repo's recurring error signatures, surfaced to the implementer on its
-  /// first attempt only (a retry already carries its own specific failing logs).
-  /// Advisory — it warns against known mistakes, never blocks. Empty list renders
-  /// nothing, so a repo with no recurring friction sees the baseline prompt.
+  /// The repo's recurring error signatures, shown to the implementer on its
+  /// first attempt only (a retry carries its own failing logs). Advisory; empty
+  /// list renders nothing, so a repo with no friction sees the baseline prompt.
   static String _pitfalls(List<String> signatures) => signatures.isEmpty
       ? ''
       : '\n<known-pitfalls>\n'
@@ -192,10 +191,9 @@ class PromptLibrary {
             '${signatures.map((s) => '- $s').join('\n')}\n'
             '</known-pitfalls>\n';
 
-  /// The risk-lane block injected into the implementer prompt. Only a high-risk
-  /// lane raises the bar (the prompt body is already written for the normal
-  /// case); tiny and an unclassified (null) lane add nothing, so the placeholder
-  /// renders empty and the prompt is byte-for-byte the baseline.
+  /// The risk-lane block for the implementer prompt. Only high-risk raises the
+  /// bar; tiny/normal/null render empty, so the prompt is byte-for-byte the
+  /// baseline.
   static String _implementerRisk(RiskLane? lane) => switch (lane) {
     RiskLane.highRisk =>
       '\n<risk lane="high-risk">\n'
@@ -219,10 +217,8 @@ class PromptLibrary {
   };
 
   /// Points the implementer at the sibling slices already committed on this PRD
-  /// branch, so it reads what they actually built instead of guessing their
-  /// interfaces. Rendered only when there is a PRD (parent), so a standalone
-  /// PRD-of-one — which never has siblings — sees nothing. Backward-looking,
-  /// the counterpart to the forward-looking SLICE_MAP (still-open siblings).
+  /// branch, so it reads what they built instead of guessing. Rendered only when
+  /// there is a PRD parent. The backward-looking counterpart to SLICE_MAP.
   static String _siblingHistory(String base) =>
       '\n### Sibling slices already landed on this branch\n'
       'Earlier slices of this PRD are already committed here. Before defining '
@@ -262,9 +258,8 @@ class PromptLibrary {
     });
   }
 
-  /// The risk-lane note injected into the PR reviewer prompt. Only a high-risk
-  /// PRD tightens the bar; otherwise the placeholder renders empty so the prompt
-  /// is the baseline. Advisory — it steers the reviewer, never blocks the loop.
+  /// The risk-lane note for the PR reviewer prompt. Only high-risk tightens the
+  /// bar; otherwise empty. Advisory — it steers the reviewer, never blocks.
   static String _prVerifierRisk(RiskLane? lane) => lane != RiskLane.highRisk
       ? ''
       : '\n\nThis PRD is HIGH-RISK (auth, data model / migration, a public '

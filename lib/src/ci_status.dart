@@ -1,9 +1,8 @@
 import 'dart:convert';
 
-/// The aggregate verdict of a PR's remote CI checks, distilled from GitHub's
-/// `statusCheckRollup`. Precedence is `pending > failing > passing > none`: the
-/// final phase waits while anything is still running ([CiState.pending]) so a
-/// fix never fires against a half-finished run, then acts on the settled state.
+/// A PR's aggregate remote-CI verdict from GitHub's `statusCheckRollup`.
+/// Precedence `pending > failing > passing > none`: the final phase waits out
+/// anything still running so a fix never fires against a half-finished run.
 enum CiState {
   /// No check runs or commit statuses are attached to the head commit at all —
   /// the repo has no CI for this branch (or none has registered yet).
@@ -32,9 +31,8 @@ class CiStatus {
 
   final CiState state;
 
-  /// `true` mergeable, `false` conflicting, `null` when GitHub has not computed
-  /// it yet. A passing build that is not mergeable still must not be marked
-  /// ready — base moved under the branch.
+  /// `true` mergeable, `false` conflicting, `null` not yet computed. A passing
+  /// build that is not mergeable must still not be marked ready — base moved.
   final bool? mergeable;
 
   /// De-duplicated GitHub Actions run ids behind the failing checks, in first-
@@ -42,11 +40,10 @@ class CiStatus {
   final List<int> failedRunIds;
 }
 
-/// Parses the JSON from `gh pr view <ref> --json statusCheckRollup,mergeable`
-/// into a [CiStatus]. Tolerant by construction: malformed JSON, a missing
-/// rollup, or unknown entry shapes degrade to [CiState.none] rather than throw,
-/// so a parse hiccup never fails a PR — the caller just sees "no CI" and falls
-/// back to the local-gate verdict.
+/// Parses `gh pr view <ref> --json statusCheckRollup,mergeable` into a
+/// [CiStatus]. Tolerant: malformed JSON, a missing rollup, or unknown shapes
+/// degrade to [CiState.none] rather than throw, so a parse hiccup falls back to
+/// the local-gate verdict instead of failing a PR.
 CiStatus parseCiStatus(String ghJson) {
   final Map<String, dynamic> root;
   try {
@@ -80,7 +77,6 @@ CiStatus parseCiStatus(String ghJson) {
   for (final raw in rollup) {
     if (raw is! Map<String, dynamic>) continue;
     switch (raw['__typename']) {
-      // GitHub Actions / app check runs.
       case 'CheckRun':
         if (raw['status'] != 'COMPLETED') {
           anyPending = true;
@@ -97,7 +93,7 @@ CiStatus parseCiStatus(String ghJson) {
             anyFailing = true;
             addRun(runIdFromDetailsUrl(raw['detailsUrl'] as String?));
         }
-      // Legacy commit statuses (e.g. external CI posting via the Status API).
+      // Legacy commit statuses (external CI via the Status API).
       case 'StatusContext':
         switch (raw['state']) {
           case 'SUCCESS':
@@ -126,20 +122,18 @@ CiStatus parseCiStatus(String ghJson) {
 
 final _runIdInUrl = RegExp(r'/actions/runs/(\d+)');
 
-/// Pulls the Actions run id out of a check's `detailsUrl`/`targetUrl`, e.g.
-/// `https://github.com/o/r/actions/runs/123456/job/789` → `123456`. Returns
-/// null for a URL that is not an Actions-run link (an external CI's own URL),
-/// in which case there are no `gh run` logs to fetch.
+/// Pulls the Actions run id from a check's `detailsUrl`/`targetUrl`
+/// (`.../actions/runs/123456/job/789` → `123456`). Null for a non-Actions URL,
+/// where there are no `gh run` logs to fetch.
 int? runIdFromDetailsUrl(String? url) {
   if (url == null) return null;
   final match = _runIdInUrl.firstMatch(url);
   return match == null ? null : int.tryParse(match.group(1)!);
 }
 
-/// The CI poll cadence, a pure function of how long we have been watching:
-/// every 30s for the first 5 minutes, every 60s through 15 minutes, every 120s
-/// after that. Mirrors the no-mistakes schedule — tight while CI is most likely
-/// to flip, then backing off so a slow build is not hammered.
+/// The CI poll cadence by elapsed watch time: 30s for the first 5 min, 60s
+/// through 15 min, 120s after — tight while CI is most likely to flip, then
+/// backing off so a slow build is not hammered.
 Duration ciPollInterval(Duration elapsed) {
   if (elapsed < const Duration(minutes: 5)) return const Duration(seconds: 30);
   if (elapsed < const Duration(minutes: 15)) return const Duration(seconds: 60);

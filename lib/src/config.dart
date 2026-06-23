@@ -20,12 +20,10 @@ class Config {
   final String state;
   final String base;
 
-  /// The top implementer model and escalation ceiling (default `opus`). The
-  /// slice implementer starts each slice on its risk lane's floor (Sonnet for
-  /// tiny/normal, Opus for high-risk) and climbs toward this ceiling one rung
-  /// per failed retry — see `model_ladder.dart`. The PRD-level review/CI fixers
-  /// run on this model directly. Lowering it (e.g. `--model sonnet`) caps every
-  /// lane at or below it.
+  /// The top implementer model and escalation ceiling (default `opus`). Each
+  /// slice opens on its lane floor (Sonnet tiny/normal, Opus high-risk) and
+  /// climbs toward this ceiling one rung per failed retry (`model_ladder.dart`);
+  /// review/CI fixers run on it directly. Lowering it caps every lane ≤ it.
   final String model;
   final bool dryRun;
 
@@ -48,19 +46,16 @@ class Config {
   /// over `origin/<pr-base>..HEAD`, comment the verdict, mark ready if green.
   final String? reviewPr;
 
-  /// How many sub-issues the harness implements concurrently. `1` keeps the
-  /// proven sequential path (`_selectActivePrd`/`_drainPrd`); `> 1` activates
-  /// the worker pool — each issue in its own git worktree, scheduled by its
-  /// `## Blocked by` DAG. Capped at 4 (`bin/dartralph.dart`): the binding
-  /// constraint is the shared Claude account's rate limit, not CPU.
+  /// How many sub-issues run concurrently. `1` keeps the sequential path; `> 1`
+  /// activates the worker pool — each issue in its own worktree, scheduled by
+  /// its `## Blocked by` DAG. Capped at 4: the binding constraint is the shared
+  /// Claude account's rate limit, not CPU.
   final int concurrency;
 
-  /// After a PRD's PR is opened with the local gates + review green, watch the
-  /// PR's remote CI to conclusion before marking it ready: a build green on
-  /// `fvm flutter` locally can still fail the PR's GitHub Actions (a different
-  /// OS, golden tests, integration suites, build steps). When false, the final
-  /// phase marks ready off the local verdict alone (the historical behavior). A
-  /// PR with no checks at all auto-skips the wait regardless.
+  /// After a PR opens with local gates + review green, watch its remote CI to
+  /// conclusion before marking ready: a local `fvm flutter` build can still fail
+  /// the PR's GitHub Actions (different OS, golden/integration suites). False
+  /// marks ready off the local verdict; a PR with no checks auto-skips the wait.
   final bool watchCi;
 
   /// How many times CI failures are fed back to a fixer (commit → re-gate

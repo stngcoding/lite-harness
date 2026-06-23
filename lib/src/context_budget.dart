@@ -1,9 +1,7 @@
-// Just-in-time context budgeting for the implementer/intake prompts: inject the
-// high-signal head (or tail) of a long input plus a pointer to fetch the rest on
-// demand, rather than flooding the prompt with the whole document. The slice's
-// own issue body is never clamped here — only the surrounding PRD context and
-// the comment thread, which are reference material the agent can pull in full
-// when it actually needs it.
+// Just-in-time context budgeting: inject the high-signal head/tail of a long
+// input plus a pointer to fetch the rest on demand, rather than flooding the
+// prompt. The slice's own issue body is never clamped — only the surrounding
+// PRD context and comment thread, which the agent can pull in full when needed.
 
 /// The first [maxLines] lines of a PRD [body], with a pointer to read the full
 /// issue when it was truncated. A body already within budget passes through
@@ -17,10 +15,9 @@ String clampPrdBody(String body, int parent, {int maxLines = 30}) {
       'full PRD.)_';
 }
 
-/// The last [keep] comment [blocks] joined, prefixed with a pointer to read the
-/// rest when older ones were dropped. The newest comments carry the most
-/// relevant refinements, so the tail is what we keep. Fewer than [keep] pass
-/// through unchanged; an empty list yields an empty string.
+/// The last [keep] comment [blocks] joined (the newest carry the freshest
+/// refinements), with a pointer to the rest when older ones were dropped.
+/// Fewer than [keep] pass through unchanged.
 String clampComments(List<String> blocks, int issue, {int keep = 5}) {
   if (blocks.length <= keep) return blocks.join('\n');
   final dropped = blocks.length - keep;

@@ -1,8 +1,5 @@
-/// Reads the reviewer's verdict from a transcript.
-///
-/// Only a line that is exactly `VERDICT: PASS` or `VERDICT: FAIL` counts,
-/// and the last such line wins — prose that merely mentions the format
-/// (e.g. the reviewer restating its instructions) cannot flip the outcome.
+/// Reads the reviewer's verdict: only an exact `VERDICT: PASS`/`VERDICT: FAIL`
+/// line counts, last one wins, so prose mentioning the format can't flip it.
 bool hasPassVerdict(String transcript) {
   String? lastVerdict;
   for (final line in transcript.split('\n')) {
@@ -14,23 +11,17 @@ bool hasPassVerdict(String transcript) {
   return lastVerdict == 'VERDICT: PASS';
 }
 
-/// The PR comment to post from a diff-verifier PR-mode run.
-///
-/// Mode B always prints its comment under a `### Code review` heading, so the
-/// posted comment is just that block — sliced from the last such heading. The
-/// orchestrator's intermediate narration (triage, panel fan-out, the line where
-/// it skips the repo's skill-evaluation preamble) sits *before* the heading and
-/// is dropped. If no heading is found (an errored run), the trimmed transcript
-/// is returned so something still surfaces.
+/// The PR comment from a diff-verifier run: the block under the last
+/// `### Code review` heading, dropping the orchestrator's earlier narration.
+/// Falls back to the whole transcript if no heading is found (an errored run).
 String reviewComment(String transcript) {
   final i = transcript.lastIndexOf('### Code review');
   return i == -1 ? transcript.trim() : transcript.substring(i).trim();
 }
 
-/// How risky a slice is, set by the intake agent and used to scale the gate:
-/// it tunes the implementer's guidance and the PR reviewer's bar, but never
-/// blocks the AFK loop. Ordered least → most risky so a PRD can take the max
-/// of its slices' lanes.
+/// How risky a slice is, set by intake to scale the implementer guidance and
+/// reviewer bar (never blocks the loop). Ordered least → most risky so a PRD
+/// can take the max of its slices' lanes.
 enum RiskLane {
   tiny('tiny'),
   normal('normal'),
@@ -42,11 +33,8 @@ enum RiskLane {
   final String label;
 }
 
-/// Reads the intake agent's risk lane from a transcript.
-///
-/// Mirrors [hasPassVerdict]: only a line that is exactly `LANE: <label>` counts
-/// and the last such line wins, so prose that merely mentions the format cannot
-/// flip the lane. Returns null when no lane line is present — the caller then
+/// Reads the intake risk lane, mirroring [hasPassVerdict]: only an exact
+/// `LANE: <label>` line counts, last one wins. Null when absent — the caller
 /// defaults to a safe lane rather than treating absence as a failure.
 RiskLane? parseLane(String transcript) {
   RiskLane? last;

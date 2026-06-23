@@ -1,19 +1,13 @@
 import 'dart:io';
 import 'dart:isolate';
 
-/// Ships the Claude Code agents the harness's review gate depends on.
-///
-/// The authoritative `claude --agent diff-verifier` gate needs an agent named
-/// `diff-verifier` to exist where `claude` runs; in PR mode that orchestrator
-/// fans the review out to two worker agents (`pr-review-lens`, the independent
-/// panel reviewers, and `pr-review-haiku`, the triage/scoring helper). The
-/// harness bundles all three and drops each into the target repo's
-/// `.claude/agents/` when it is absent, so a fresh clone is not silently failed
-/// by every gate.
-///
-/// An existing agent is never overwritten: a target that ships its own tuned
-/// reviewer keeps it. Each written path is excluded from drift detection (see
-/// [GitOps.artifactExcludes]) so it never rides along in an issue commit.
+/// Ships the Claude Code agents the review gate depends on. The
+/// `claude --agent diff-verifier` gate needs `diff-verifier` to exist where
+/// `claude` runs; in PR mode it fans out to `pr-review-lens` (panel reviewers)
+/// and `pr-review-haiku` (triage/scoring). The harness bundles all three (plus
+/// `intake`) and drops each into the target's `.claude/agents/` only when
+/// absent — a fresh clone is not silently failed, a target's own reviewer is
+/// kept. Written paths are drift-excluded ([GitOps.artifactExcludes]).
 class AgentInstaller {
   AgentInstaller({Future<String> Function(String name)? loadBundled})
     : _loadBundled = loadBundled ?? _resolveBundled;
@@ -53,8 +47,8 @@ class AgentInstaller {
   }
 
   static Future<String> _resolveBundled(String name) async {
-    // The harness always runs from source (never AOT-compiled), so the package
-    // URI always resolves to lib/agents/<name>.md.
+    // The harness always runs from source (never AOT), so the package URI
+    // resolves to lib/agents/<name>.md.
     final uri = await Isolate.resolvePackageUri(
       Uri.parse('package:dartralph/agents/$name.md'),
     );

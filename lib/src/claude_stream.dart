@@ -13,10 +13,9 @@ class AssistantTextEvent extends StreamEvent {
   final String text;
 }
 
-/// An extended-thinking block. Shown live in full (it is the agent's reasoning,
-/// useful for AFK watchers) but kept OUT of the transcript: the verdict protocol
-/// reads the transcript, and a stray `VERDICT:` line in reasoning must never be
-/// mistaken for the real verdict.
+/// An extended-thinking block. Shown live but kept OUT of the transcript: the
+/// verdict is read from the transcript, so a stray `VERDICT:` line in reasoning
+/// must never be mistaken for the real one.
 class AssistantThinkingEvent extends StreamEvent {
   const AssistantThinkingEvent(this.text);
 
@@ -30,11 +29,10 @@ class ToolUseEvent extends StreamEvent {
   final String summary;
 }
 
-/// The per-turn token usage carried on an `assistant` message. [contextTokens]
-/// is how much of the model's context window that turn's request filled —
-/// `input_tokens` plus both cache figures (a cache *read* still occupies the
-/// window). The peak across a run is the high-water mark of context pressure on
-/// the agent: a big injected prompt and a long tool loop both push it up.
+/// The per-turn token usage on an `assistant` message. [contextTokens] is how
+/// much of the context window that turn filled — `input_tokens` plus both cache
+/// figures (a cache *read* still occupies the window). Its run peak is the
+/// high-water mark of context pressure on the agent.
 class UsageEvent extends StreamEvent {
   const UsageEvent(this.contextTokens);
 
@@ -42,8 +40,8 @@ class UsageEvent extends StreamEvent {
 }
 
 /// The terminal `result` event a headless `claude -p` run emits once, carrying
-/// the run's telemetry. None of this is in the transcript the verdict reads —
-/// it is surfaced separately for AFK monitoring (cost, turns, failure mode).
+/// the run's telemetry (cost, turns, failure mode). Not in the transcript the
+/// verdict reads — surfaced separately for AFK monitoring.
 class ResultEvent extends StreamEvent {
   const ResultEvent({
     required this.subtype,
@@ -77,17 +75,15 @@ class ResultEvent extends StreamEvent {
   /// (e.g. `Not logged in · Please run /login`).
   final String? resultText;
 
-  /// The run failed in a way the harness cannot recover from by moving to the
-  /// next issue — auth, billing, an exhausted API retry, etc. Every subsequent
-  /// `claude` call would fail the same way, so the loop should abort. A
+  /// The run failed in a way moving to the next issue cannot fix (auth, billing,
+  /// an exhausted API retry) — every subsequent call fails the same, so abort. A
   /// per-task failure like `error_max_turns` is deliberately NOT fatal.
   bool get isFatal =>
       subtype == 'error_during_execution' || (isError && subtype == 'success');
 
-  /// Whether a fatal run is *transient* — an error thrown mid-execution (an
-  /// exhausted internal API retry) or an overloaded/5xx status — so retrying the
-  /// same `claude` run after a backoff can recover. Auth/billing statuses
-  /// (401/402/403) are never transient: every retry fails the same way.
+  /// Whether a fatal run is *transient* — mid-execution error or 5xx status — so
+  /// a backed-off retry can recover. Auth/billing statuses (401/402/403) never
+  /// are: every retry fails the same.
   bool get isTransientApi {
     final status = apiErrorStatus;
     if (status == 401 || status == 402 || status == 403) return false;
@@ -117,9 +113,9 @@ class ResultEvent extends StreamEvent {
   }
 }
 
-/// A `rate_limit_event`. Emitted after each API call; `allowed` is the normal
-/// case, `rate_limited` means the run is stalling and every subsequent call
-/// will too — a fatal, abort-the-loop condition for AFK runs.
+/// A `rate_limit_event`, emitted after each API call. `rate_limited` means the
+/// quota is exhausted and every subsequent call will stall too — a fatal,
+/// abort-the-loop condition for AFK runs.
 class RateLimitEvent extends StreamEvent {
   const RateLimitEvent({
     required this.status,
@@ -142,10 +138,9 @@ class RateLimitEvent extends StreamEvent {
   }
 }
 
-/// A `system/api_retry` event: claude hit a transient API failure (overloaded,
-/// server error, dropped stream) and is retrying. Shown live so AFK watchers
-/// can see streaming hiccups; not fatal on its own (an exhausted retry shows up
-/// as an `error_during_execution` result, which is).
+/// A `system/api_retry` event: claude hit a transient API failure and is
+/// retrying. Shown live but not fatal on its own — an exhausted retry surfaces
+/// as an `error_during_execution` result, which is.
 class ApiRetryEvent extends StreamEvent {
   const ApiRetryEvent({
     required this.error,
@@ -251,9 +246,8 @@ List<StreamEvent> parseStreamJsonLine(String line) {
   return const [];
 }
 
-/// The context-window occupancy of a turn from its `usage` map: fresh input
-/// plus both cache figures. A cache *read* does not bill full price but still
-/// fills the window, so it counts toward the headroom calculation.
+/// A turn's context-window occupancy from its `usage` map: fresh input plus both
+/// cache figures (a cache *read* still fills the window).
 int _contextTokens(Map usage) {
   int n(Object? v) => (v as num?)?.toInt() ?? 0;
   return n(usage['input_tokens']) +
@@ -292,9 +286,8 @@ class StreamRenderer {
 
   int _peakContextTokens = 0;
 
-  /// The highest context-window occupancy seen across the run (0 if no `usage`
-  /// was reported). Lets the caller record how close the agent ran to its
-  /// context limit.
+  /// The highest context-window occupancy seen across the run (0 if no `usage`),
+  /// so the caller can record how close the agent ran to its limit.
   int get peakContextTokens => _peakContextTokens;
 
   ResultEvent? _result;
@@ -305,9 +298,8 @@ class StreamRenderer {
 
   RateLimitEvent? _rateLimited;
 
-  /// The first `rate_limited` event seen, if any. The loop treats this as a
-  /// fatal, abort-the-loop condition: the quota is exhausted and every
-  /// subsequent call will stall too.
+  /// The first `rate_limited` event seen, if any — a fatal, abort-the-loop
+  /// condition: the quota is exhausted and every subsequent call will stall too.
   RateLimitEvent? get rateLimited => _rateLimited;
 
   void onLine(String line) {

@@ -1,11 +1,9 @@
 import 'dart:io';
 
-/// ANSI styling for the harness's live output.
-///
-/// Pure string helpers so the rendering logic stays unit-testable: construct
-/// `Ansi(enabled: false)` in tests to get plain strings, or `Ansi.forStdout()`
-/// in production. Color is suppressed when stdout is not a terminal or when
-/// `NO_COLOR` is set (https://no-color.org/).
+/// ANSI styling for live output. Pure string helpers so rendering stays
+/// unit-testable: `Ansi(enabled: false)` for plain strings, `Ansi.forStdout()`
+/// in production. Color is off when stdout is not a terminal or `NO_COLOR` is
+/// set (https://no-color.org/).
 class Ansi {
   const Ansi({required this.enabled});
 

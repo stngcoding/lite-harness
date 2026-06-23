@@ -1,11 +1,9 @@
 import 'ansi.dart';
 
-/// The operational stages of one harness run, in execution order.
-///
-/// Each stage carries a short label and a color, so a human skimming a
-/// long AFK run can tell at a glance which stage is currently active. This is
-/// the harness pipeline — distinct from an issue's own `## Phase` metadata
-/// (see `phaseOf` in issue.dart).
+/// The operational stages of one harness run, in execution order. Each carries
+/// a label and color so a human skimming a long AFK run sees the active stage at
+/// a glance. The harness pipeline — distinct from an issue's own `## Phase`
+/// metadata (see `phaseOf` in issue.dart).
 enum HarnessPhase {
   select('SELECT'),
   checkout('CHECKOUT'),

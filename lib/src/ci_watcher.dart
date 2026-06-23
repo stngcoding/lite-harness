@@ -1,18 +1,16 @@
 part of 'loop.dart';
 
-/// How watching a PR's remote CI concluded (`_watchCi`). [ready] and [noCi] both
-/// let the caller mark the PR ready (a green CI, or a repo with no checks at all
-/// that auto-skips the wait); [failed] and [timedOut] leave the PR a draft for a
-/// human — CI stayed red past the fix budget, or never settled in time.
+/// How watching a PR's remote CI concluded (`_watchCi`). [ready] (green) and
+/// [noCi] (a repo with no checks) both let the caller mark the PR ready; [failed]
+/// (red past the fix budget) and [timedOut] (never settled) leave it a draft.
 enum _CiOutcome { ready, noCi, failed, timedOut }
 
 extension _CiWatcher on HarnessLoop {
-  /// One CI auto-fix round: fetch the failed-job logs, run the ci-fixer over the
-  /// existing PRD tree, commit its change, re-run the LOCAL gates (a CI fix must
-  /// not regress them), and re-push so CI runs again. Returns true when a fix
-  /// was committed and pushed (keep watching); false when there is nothing more
-  /// to try — the fixer made no change, leaked a secret, regressed a local gate,
-  /// or the push failed — and the caller leaves the PR a draft.
+  /// One CI auto-fix round: fetch the failed-job logs, run the ci-fixer, commit,
+  /// re-run the local gates (a CI fix must not regress them), and re-push. Returns
+  /// true when a fix was committed and pushed (keep watching); false when there is
+  /// nothing more to try — no change, a secret leak, a local-gate regression, or a
+  /// failed push — and the caller leaves the PR a draft.
   Future<bool> _runCiFix(
     int activeParent,
     String title,
@@ -81,8 +79,8 @@ extension _CiWatcher on HarnessLoop {
       'Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>',
     );
 
-    // A CI fix must keep the local gates green; if it regresses them the fix is
-    // not trustworthy. Leave the commit (nothing rolled back) but hand off.
+    // A CI fix that regresses the local gates is not trustworthy: leave the
+    // commit (nothing rolled back) but hand off.
     final analyzeOk = await _gate(HarnessPhase.analyze, [
       'flutter',
       'analyze',
@@ -116,9 +114,7 @@ extension _CiWatcher on HarnessLoop {
     return true;
   }
 
-  /// The handoff comment when CI watching ends without a green: the local gates
-  /// and review passed, but [reason] kept the PR from going ready, so it is left
-  /// a draft for a human. Nothing is rolled back.
+  /// Posts the CI-watch handoff comment ([ciHandoffComment]) on the draft PR.
   Future<void> _commentCiHandoff(String url, String reason) async {
     await gh.commentOnPr(url, ciHandoffComment(reason));
   }

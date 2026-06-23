@@ -4,12 +4,10 @@ import 'dart:io';
 /// harness's other run artifacts (`/tmp/ralph-analyze.log`, `/tmp/ralph-test.log`).
 const eventLogPath = '/tmp/ralph-events.log';
 
-/// Append-only, machine-readable record of the harness's event sequence for a
-/// single run. Each [event] writes one line
-/// `<ISO8601> <NAME> [prd=N] [issue=N] [detail]`, flushed synchronously so the
-/// trail survives a crash or a `kill` mid-run — exactly when a debugging agent
-/// needs to reconstruct what happened. The file is truncated when the log is
-/// created, so it always holds just the latest run.
+/// Append-only, machine-readable record of one run's event sequence. Each
+/// [event] writes `<ISO8601> <NAME> [prd=N] [issue=N] [detail]`, flushed
+/// synchronously so the trail survives a crash or `kill` mid-run. Truncated on
+/// creation, so it always holds just the latest run.
 class EventLog {
   EventLog([this.path = eventLogPath]) {
     File(path).writeAsStringSync('');

@@ -1,12 +1,8 @@
-/// The "previous attempt" block appended to the implementer's `{{RETRY}}`
-/// feedback: the patch the failed attempt actually produced, so the agent fixes
-/// forward from what it already tried instead of re-deriving the slice blind and
-/// repeating the same mistake.
-///
-/// The full [diff] is inlined only while it is small enough to read
-/// ([maxLines]); past that the bounded `--stat` [diffStat] is used instead so a
-/// large slice's patch never floods the prompt. An empty diff yields an empty
-/// block (the no-changes retry path has nothing to show).
+/// The "previous attempt" block for the implementer's `{{RETRY}}` feedback: the
+/// patch the failed attempt produced, so the agent fixes forward instead of
+/// re-deriving blind and repeating the mistake. The full [diff] is inlined while
+/// small ([maxLines]), else the bounded `--stat` [diffStat]; an empty diff
+/// yields an empty block.
 String previousAttemptBlock(
   String diff,
   String diffStat, {

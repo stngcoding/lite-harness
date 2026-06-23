@@ -1,18 +1,14 @@
 import 'dart:convert';
 import 'dart:io';
 
-/// Persistent path for the per-call cost ledger. Lives in the target repo
-/// beside `.dartralph/traces.jsonl` (not under `/tmp` like the per-run event
-/// log) so the spend record survives across runs and is analyzable after the
-/// fact — the durable answer to "which phase/model burned the most on this
-/// PRD". Excluded from commits/drift via `GitOps.artifactExcludes`.
+/// The per-call cost ledger path. Lives in the target repo (not `/tmp` like the
+/// event log) so the spend record survives across runs for after-the-fact
+/// analysis. Excluded from commits/drift via `GitOps.artifactExcludes`.
 const callLogPath = '.dartralph/calls.jsonl';
 
-/// Which step of the loop a `claude` call belongs to. This is the dimension the
-/// cost report groups by — the original "$20 per PRD, where does it go?"
-/// question is answered by the per-phase spend split. `classify` runs the
-/// intake agent; `prReview` runs the diff-verifier; the rest run the
-/// implementer model.
+/// Which step of the loop a `claude` call belongs to — the dimension the cost
+/// report groups by. `classify` runs the intake agent, `prReview` the
+/// diff-verifier, the rest the implementer model.
 enum CallPhase {
   classify('classify'),
   implement('implement'),
@@ -25,12 +21,9 @@ enum CallPhase {
   final String label;
 }
 
-/// Each model's billed cost relative to Opus (= 1.0), derived from the public
-/// per-MTok pricing and assumed proportional per call: Sonnet bills 0.6× and
-/// Haiku 0.2× an Opus call of the same token shape, Fable 2.0×. This is what
-/// lets [summarizeCalls] estimate the all-Opus counterfactual — what the
-/// implement spend *would* have been with no lane tiering — so the savings the
-/// `model_ladder` buys are visible, not guessed.
+/// Each model's billed cost relative to Opus (= 1.0), from public per-MTok
+/// pricing and assumed proportional per call. Lets [summarizeCalls] estimate the
+/// all-Opus counterfactual, so the lane-tiering saving is visible, not guessed.
 const modelCostFactor = <String, double>{
   'haiku': 0.2,
   'sonnet': 0.6,
@@ -38,10 +31,9 @@ const modelCostFactor = <String, double>{
   'fable': 2.0,
 };
 
-/// One `claude` call's terminal telemetry: which phase/issue it served, the
-/// model it ran on, and the cost/turns/duration the `result` event reported.
-/// Appended once per completed call — the structured form of the
-/// `└ N turns · $X · Ys` line the human transcript prints and then forgets.
+/// One `claude` call's terminal telemetry: phase/issue served, model, and the
+/// cost/turns/duration the `result` reported — the structured, durable form of
+/// the `└ N turns · $X · Ys` line the transcript prints and forgets.
 class CallRecord {
   const CallRecord({
     required this.ts,
@@ -85,31 +77,28 @@ class CallRecord {
   /// The PRD parent for grouping, or null for a PRD-of-one.
   final int? prd;
 
-  /// The model the call ran on (`sonnet`, `opus`, …), or null for an
-  /// agent-pinned call whose model the harness does not pass (`classify`,
-  /// `prReview`). Null calls are left out of the by-model split and the
-  /// all-Opus counterfactual.
+  /// The model the call ran on, or null for an agent-pinned call whose model the
+  /// harness does not pass (`classify`, `prReview`) — null calls drop out of the
+  /// by-model split and the all-Opus counterfactual.
   final String? model;
 
-  /// The 1-based implement attempt this call was, or null for non-implement
-  /// phases — so an escalation (a retry that climbed a model rung) is visible.
+  /// The 1-based implement attempt, or null for non-implement phases — so an
+  /// escalation (a retry that climbed a model rung) is visible.
   final int? attempt;
 
   final double costUsd;
   final int numTurns;
   final int durationMs;
 
-  /// Context-window headroom left at the call's peak, as a percentage — a low
-  /// value flags a call that ran close to truncating its own working memory.
+  /// Context-window headroom at the call's peak — a low value flags a call that
+  /// ran close to truncating its own working memory.
   final double? ctxFreePct;
 
-  /// The `result` event subtype (`success`, `error_max_turns`,
-  /// `error_during_execution`), or null when the process died before emitting
-  /// one. The high-signal field for debugging which calls failed.
+  /// The `result` subtype (`success`, `error_max_turns`, …), or null when the
+  /// process died before emitting one — the signal for which calls failed.
   final String? outcome;
 
-  /// Tool calls the permission layer blocked — non-zero means the agent
-  /// silently failed to do something.
+  /// Tool calls the permission layer blocked — non-zero means a silent failure.
   final int denials;
 
   String toJsonLine() => jsonEncode({
@@ -128,10 +117,9 @@ class CallRecord {
   });
 }
 
-/// Append-only JSONL ledger for [CallRecord]s. Synchronous append (like
-/// `TraceStore`/`EventLog`) so a call's spend survives a crash mid-run; creates
-/// `.dartralph/` on first write. Never truncates — the point is a durable spend
-/// history a later run (or a human) can analyze without re-scraping stdout.
+/// Append-only JSONL ledger for [CallRecord]s. Synchronous append so a call's
+/// spend survives a crash mid-run; never truncates — the point is a durable
+/// history a later run (or human) can analyze without re-scraping stdout.
 class CallLog {
   CallLog([this.path = callLogPath]);
 
@@ -208,7 +196,7 @@ class CostReport {
   final List<ModelStat> modelStats;
 
   /// Actual implement spend, and what it would have been with every implement
-  /// call on Opus — the gap is the lane-tiering saving (an estimate: it assumes
+  /// call on Opus — the gap is the lane-tiering saving (an estimate, assuming
   /// each call's token shape is model-independent).
   final double implementActualUsd;
   final double implementAllOpusUsd;
@@ -274,11 +262,9 @@ class CostReport {
 }
 
 /// Aggregates [records] into a [CostReport]: totals, the per-phase and per-model
-/// spend splits (most-expensive first), and the implement lane-tiering
-/// counterfactual. The all-Opus estimate sums each implement call's
-/// `cost / modelCostFactor[model]` (Opus's factor is 1.0, so an Opus call is
-/// unchanged; a Sonnet call grosses up to its Opus-equivalent), skipping calls
-/// whose model is unknown or unpriced.
+/// spend splits, and the implement lane-tiering counterfactual. The all-Opus
+/// estimate sums each implement call's `cost / modelCostFactor[model]` (so a
+/// Sonnet call grosses up to its Opus-equivalent), skipping unpriced models.
 CostReport summarizeCalls(List<CallRecord> records) {
   final phaseCost = <CallPhase, double>{};
   final phaseCalls = <CallPhase, int>{};

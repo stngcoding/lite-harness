@@ -1,11 +1,7 @@
-/// Pure secret detection over a unified `git diff`, used as a hard gate before
-/// the harness commits a slice: any hit blocks the commit (tag fail + relabel
-/// for a human) rather than letting a leaked credential ride into a PR.
-///
-/// Only *added* content is inspected — a secret already on the base branch is
-/// out of scope (the harness cannot act on it and would only emit noise). Each
-/// finding names the rule and the file but never echoes the matched value, so
-/// the block message itself does not re-leak the secret.
+/// Pure secret detection over a unified `git diff` — a hard gate before commit:
+/// any hit blocks the slice. Only *added* content is scanned (a base secret is
+/// out of scope); findings name the rule and file but never the value, so the
+/// block message does not re-leak it.
 List<String> scanSecrets(String diff) {
   final findings = <String>{};
   String? file;
@@ -16,14 +12,13 @@ List<String> scanSecrets(String diff) {
       file = path == '/dev/null'
           ? null
           : path.replaceFirst(RegExp(r'^[ab]/'), '');
-      // A newly tracked secret env file is itself the finding; its body lines
-      // are then skipped so each leaked key does not double-report.
+      // A tracked secret env file is itself the finding; skip its body so each
+      // key does not double-report.
       skipFileBody = file != null && _isEnvSecretFile(file);
       if (skipFileBody) findings.add('committed secret file: $file');
       continue;
     }
     if (skipFileBody) continue;
-    // Only added content matters; `+++` headers are handled above.
     if (!line.startsWith('+') || line.startsWith('+++')) continue;
     final added = line.substring(1);
     for (final rule in _rules) {
@@ -41,9 +36,8 @@ class _SecretRule {
   final String label;
   final RegExp pattern;
 
-  /// Whether a placeholder/env-reference on the line suppresses the match —
-  /// only the FP-prone generic-credential rule opts in; the structurally
-  /// specific rules (AWS, key headers, provider tokens) always fire.
+  /// Whether a placeholder/env-reference suppresses the match — only the
+  /// FP-prone generic-credential rule opts in; the specific rules always fire.
   final bool skipPlaceholders;
 }
 

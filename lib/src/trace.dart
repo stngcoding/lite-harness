@@ -3,16 +3,14 @@ import 'dart:io';
 
 import 'verdict.dart';
 
-/// Persistent path for the cross-run trace log. Unlike the per-run [EventLog]
-/// (truncated each run under `/tmp`), this lives in the target repo so friction
-/// accumulates across runs — that is what makes the propose step able to spot a
-/// pattern that only shows up over several runs. Excluded from commits/drift via
-/// `GitOps.artifactExcludes`.
+/// The cross-run trace log path. Unlike the per-run [EventLog] (truncated under
+/// `/tmp`), it lives in the target repo so friction accumulates across runs —
+/// what lets the propose step spot a multi-run pattern. Excluded from
+/// commits/drift via `GitOps.artifactExcludes`.
 const traceStorePath = '.dartralph/traces.jsonl';
 
-/// A named reason a slice or PR did not sail through cleanly. These are the
-/// signals the propose step counts: a single one is noise, the same one
-/// recurring is a harness problem worth surfacing.
+/// A named reason a slice or PR did not sail through. The propose step counts
+/// these: one is noise, the same one recurring is a harness problem to surface.
 enum FrictionKind {
   gateAnalyzeFail,
   gateTestFail,
@@ -73,14 +71,13 @@ class TraceRecord {
   final List<FrictionKind> frictions;
   final String? detail;
 
-  /// One-line error signature for a non-pass outcome (the first failing line of
-  /// the analyze/test log), or null for a clean pass. This is the high-signal
-  /// bit [recurringSignatures] aggregates into the implementer's pitfalls digest.
+  /// One-line error signature for a non-pass outcome (the first failing log
+  /// line), or null on a clean pass — the bit [recurringSignatures] aggregates
+  /// into the implementer's pitfalls digest.
   final String? signature;
 
-  /// The model the last implement attempt ran on (e.g. `sonnet`, `opus`), or
-  /// null for a trace written before model tiering. Makes the lane→model
-  /// tiering and any retry escalation visible in the log.
+  /// The model the last implement attempt ran on, or null for a trace written
+  /// before model tiering — makes lane→model tiering and escalation visible.
   final String? model;
 
   String toJsonLine() => jsonEncode({
@@ -97,9 +94,8 @@ class TraceRecord {
   });
 }
 
-/// Append-only JSONL store for [TraceRecord]s. Synchronous append (like
-/// [EventLog]) so a trace survives a crash mid-run; creates `.dartralph/` on
-/// first write. Never truncates — the whole point is cross-run history.
+/// Append-only JSONL store for [TraceRecord]s. Synchronous append so a trace
+/// survives a crash mid-run; never truncates — the point is cross-run history.
 class TraceStore {
   TraceStore([this.path = traceStorePath]);
 
@@ -187,9 +183,8 @@ class FrictionReport {
   }
 }
 
-/// Canned, rule-based suggestions per friction kind. Deterministic by design:
-/// the propose step surfaces evidence and a fixed next-step, it does not invent
-/// free-form recommendations.
+/// Canned suggestion per friction kind. Deterministic by design: the propose
+/// step surfaces evidence and a fixed next-step, never a free-form invention.
 const _suggestions = <FrictionKind, String>{
   FrictionKind.gateAnalyzeFail:
       'Repeated analyze failures — surface the project lint rules more '
@@ -228,9 +223,8 @@ const _suggestions = <FrictionKind, String>{
 };
 
 /// Aggregates [records] into a [FrictionReport]: friction counts, per-lane
-/// not-passed tallies, and a proposal for every friction that recurred at least
-/// twice (sorted most-frequent first). A friction seen once is left out — only
-/// a repeated pattern is actionable.
+/// not-passed tallies, and a proposal for every friction seen at least twice
+/// (most-frequent first). A one-off is left out — only a pattern is actionable.
 FrictionReport summarize(List<TraceRecord> records) {
   final frictionCounts = <FrictionKind, int>{};
   final byLane = <RiskLane, List<TraceRecord>>{};
@@ -295,10 +289,10 @@ String? errorSignature(String log) {
   return firstNonEmpty == null ? null : _clip(firstNonEmpty);
 }
 
-/// A volatility-stripped fingerprint so the same *class* of failure recurs even
-/// when it lands in a different file or at a different line (file-path tokens
-/// dropped, digits → `#`, whitespace collapsed). The discriminating parts — an
-/// analyze rule name, a matcher message — survive and key the recurrence count.
+/// A volatility-stripped fingerprint so the same *class* of failure recurs across
+/// different files/lines (path tokens dropped, digits → `#`, whitespace
+/// collapsed). The discriminating parts — a rule name, a matcher message —
+/// survive and key the recurrence count.
 String _fingerprint(String signature) => signature
     .toLowerCase()
     .replaceAll(RegExp(r'\S*\.dart\S*'), '')
@@ -306,11 +300,10 @@ String _fingerprint(String signature) => signature
     .replaceAll(RegExp(r'\s+'), ' ')
     .trim();
 
-/// Error signatures that recurred at least [minCount] times within the most
-/// recent [window] traces, most-frequent first, capped at [top]. A single
-/// failure is noise; the same class recurring is a real repo pitfall — this is
-/// the source of the implementer's "known pitfalls" digest. Each returned string
-/// is the most recent raw signature for its fingerprint (a concrete example).
+/// Error signatures seen at least [minCount] times within the most recent
+/// [window] traces, most-frequent first, capped at [top] — the source of the
+/// implementer's "known pitfalls" digest. Each returned string is the most recent
+/// raw signature for its fingerprint (a concrete example).
 List<String> recurringSignatures(
   List<TraceRecord> records, {
   int window = 50,
